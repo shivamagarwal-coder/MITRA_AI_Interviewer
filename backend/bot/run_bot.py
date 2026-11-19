@@ -192,7 +192,7 @@ async def run_bot(
     # The brain owns the interview: which section we are in, what the model sees,
     # when to move on. The system instruction below is only a starting value —
     # BrainDirector retargets it at the current section on every turn.
-    brain = InterviewBrain(blueprint, time_of_day=time_of_day(timezone))
+    brain = InterviewBrain(blueprint, time_of_day=time_of_day(timezone), live_speech=True)
 
     llm = build_llm(
         api_key=settings.openai_api_key,
@@ -235,6 +235,8 @@ async def run_bot(
         # Backstop. If the interview is over and the room has gone quiet,
         # end it rather than asking whether they are still there.
         interview_over=(lambda: brain.is_finished or brain.withdrew) if use_brain else None,
+        # A nudge in the closing is not a closing turn. The brain must know it is coming.
+        on_prompt=brain.silence_prompt_expected if use_brain else None,
     )
 
     # The interviewer can end the interview itself. A phrase list only ever

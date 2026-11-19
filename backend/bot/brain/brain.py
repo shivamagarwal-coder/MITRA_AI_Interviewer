@@ -314,9 +314,15 @@ class InterviewBrain:
         config: BrainConfig | None = None,
         now: float = 0.0,
         time_of_day: str | None = None,
+        live_speech: bool = False,
     ):
         self.blueprint = blueprint
         self.config = config or BrainConfig()
+        #: True in a live call. There the closing's turns are counted once, by
+        #: `bot_finished_speaking` when each utterance stops. Counting them again
+        #: from the context frame double-counted every goodbye and let a closing
+        #: question end the interview before the candidate had answered it.
+        self._live_speech = live_speech
         #: "morning" | "afternoon" | "evening". Injected rather than read from
         #: the clock so the brain stays pure and testable.
         self.time_of_day = time_of_day
@@ -415,6 +421,11 @@ class InterviewBrain:
         self._started_at = now
         self._now = now
         self._finished = False
+        #: Set by the silence ladder just before it speaks to a silent candidate
+        #: during the closing. That utterance is neither a goodbye nor an
+        #: invitation, so it must not spend one of the closing's turns. Cleared by
+        #: the candidate speaking, so a stale flag cannot swallow a real turn.
+        self._silence_prompt_pending = False
 
         self._sections[0].started_at = now
 
@@ -659,6 +670,8 @@ class InterviewBrain:
             return
 
         if candidate_text:
+            # The candidate is talking, so any silence prompt we announced is over.
+            self._silence_prompt_pending = False
             self._append(section, "candidate", candidate_text)
 
             # Leaving outranks everything else. Somebody who has said they want
@@ -871,7 +884,7 @@ class InterviewBrain:
         # Read fresh: the candidate's turn above may have moved us here. This
         # is the text-mode path; live, `bot_finished_speaking` does it, because
         # nothing observes an utterance nobody answers.
-        if self.current_section.kind == SectionKind.CLOSING and bot_text:
+        if self.current_section.kind == SectionKind.CLOSING and bot_text and not self._live_speech:
             self._closing_bot_turns += 1
             # A closing turn that asks something is inviting a last question, so
             # wait for it. One that does not is a goodbye, and there is nothing
@@ -936,6 +949,25 @@ class InterviewBrain:
             f"I'll be speaking with you today. How are you doing?"
         )
 
+    def section_budget_spent(self) -> bool:
+        """Move on when the current section's time is spent, whether or not anyone talks.
+
+        The budget used to be checked only when the candidate spoke, so a silent
+        candidate held a section open past its time. In one measured interview
+        `campaign_strategy` ran 336 s against a 196 s budget, and the silence ladder
+        ended the call before the next section began. Called by the clock, the same
+        way as `begin_time_close`. The closing has its own path and is left alone.
+        """
+        if self._finished or not self._interviewer_has_spoken:
+            return False
+        section = self.current_section
+        if section.kind not in (SectionKind.OPENING, SectionKind.COMPETENCY):
+            return False
+        if section.elapsed(self._now) < section.budget_seconds:
+            return False
+        self._advance("budget_exhausted")
+        return True
+
     def begin_time_close(self) -> bool:
         """Start the close because the scheduled time is spent. Returns whether it did.
 
@@ -946,6 +978,15 @@ class InterviewBrain:
             return False
         self._advance("time_up")
         return True
+
+    def silence_prompt_expected(self) -> None:
+        """The silence ladder is about to speak to a silent candidate.
+
+        Only the closing needs this. Elsewhere a nudge was never counted as a turn,
+        and setting the flag there would leave it lingering into the closing.
+        """
+        if self.current_section.kind == SectionKind.CLOSING:
+            self._silence_prompt_pending = True
 
     def bot_finished_speaking(self, said: str = "") -> None:
         """The interviewer has stopped talking. Called from the live pipeline.
@@ -965,6 +1006,13 @@ class InterviewBrain:
             return
         section = self.current_section
         if section.kind != SectionKind.CLOSING:
+            return
+
+        # A nudge to a silent candidate is not a closing turn. Counting it let a
+        # "Take your time" end the interview with the closing question unanswered.
+        if self._silence_prompt_pending:
+            self._silence_prompt_pending = False
+            logger.info("closing: silence prompt is not a closing turn")
             return
 
         self._closing_bot_turns += 1

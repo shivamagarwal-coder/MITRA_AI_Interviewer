@@ -27,6 +27,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    TTSSpeakFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -52,6 +53,10 @@ CLOSE_INSTRUCTION = (
 )
 
 END_REASON = "time_limit_reached"
+
+#: Spoken at the hard stop, before the call is ended. Fixed text, because the model
+#: may be mid-question when the wall arrives and cannot be relied on to close.
+HARD_STOP_GOODBYE = "Thank you for your time. Goodbye."
 
 
 #: A plain class with BaseObserver, not a dataclass. Pipecat keeps observers in a
@@ -125,9 +130,15 @@ class TimeLimit(BaseObserver):
             return
 
         if self._brain.elapsed_seconds >= self._brain.hard_stop_seconds:
+            # The call is cut here whatever the interviewer was doing, so it says
+            # goodbye first. Without this the candidate was hung up on mid-question.
+            await self._inject(TTSSpeakFrame(HARD_STOP_GOODBYE))
             await self._end("the hard stop was reached")
             return
 
+        # A silent candidate must not hold a section past its budget. The budget is
+        # otherwise only checked on candidate turns.
+        self._brain.section_budget_spent()
         self._brain.begin_time_close()
 
         await self._request_close_when_quiet()

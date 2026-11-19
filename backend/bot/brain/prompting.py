@@ -49,7 +49,7 @@ VOICE_RULES = """\
 Your whole reply contains exactly ONE question mark. Count it before you answer.
 
 The tempting move is to ask a broad question and then narrow it in the same
-breath: "Tell me about a strategy you set. What was the bet behind it?" Do not
+breath: "Tell me about a project you led. What did you measure to judge whether it worked?" Do not
 do that. It reads fine on a page and fails out loud, because the candidate hears
 two things, cannot hold both, and answers the easier one. You then lose the
 answer you actually wanted and have to spend another turn getting back to it.
@@ -59,10 +59,10 @@ broad opening, ask only that and save the follow-up for your next turn. You will
 get another turn. There is no rush.
 
 Say this:
-  "What was the bet behind that strategy?"
+  "What did you measure to judge whether it worked?"
 
 Not this:
-  "Can you tell me about a strategy you set? What was the bet behind it?"
+  "Tell me about a project you led. What did you measure to judge whether it worked?"
 
 YOUR OUTPUT IS SPOKEN ALOUD by a text-to-speech engine. Therefore:
 - Never use emoji, bullet points, markdown, headings, or numbered lists.
