@@ -1,0 +1,1477 @@
+// Admin panel.
+//
+//   Login
+//     └─ #/profiles                     a profile is a role you are hiring for
+//          └─ #/profiles/<id>
+//               ├─ what it tests        the locked evaluation spec
+//               ├─ discussion           collapsed once it is settled
+//               └─ candidates           each with where their interview stands
+//                    └─ #/candidates/<id>
+//                         ├─ the session   at most one open at a time
+//                         ├─ the plan
+//                         └─ improve the plan
+//                              └─ #/interviews/<id>
+//
+// Navigation is real: every screen has its own URL in the hash, so the back
+// button, forward, refresh and bookmarks all behave. Screens are reached with
+// ordinary <a href> links rather than click handlers, which is what makes
+// middle-click and copy-link-address work too.
+//
+// Plain JavaScript, no build step. Every request goes through api(), and every
+// product fact the screens state comes from /config, so the panel cannot drift
+// from the server it describes.
+//
+// Inline handlers (onclick="...") are not used: the page's Content-Security-Policy
+// forbids them. Buttons carry data-action and data-id instead, and one listener on
+// #app dispatches them (see ACTIONS below).
+
+const app = document.getElementById("app");
+
+// ---------------------------------------------------------------- utilities
+
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  if (response.status === 401 && !path.startsWith("/admin/")) {
+    renderLogin();
+    throw new Error("Signed out.");
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || `${response.status} on ${path}`);
+  return body;
+}
+
+const esc = (s) =>
+  String(s ?? "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const when = (iso) =>
+  new Date(iso).toLocaleString(undefined, {
+    day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+
+// Filled in from /config before the first render (see start() at the bottom).
+// The interview-length rule is shown wherever the length appears, so it is visible
+// while someone is deciding rather than after a spec has been refused. The retention
+// period is the number the candidate is promised on the consent notice, so the panel
+// must state the same one.
+let config = {};
+let DURATION_MIN = 0;
+let DURATION_MAX = 0;
+let RETENTION_DAYS = 0;
+
+const LABELS = {
+  not_scheduled: "no session",
+  in_progress: "in progress",
+  awaiting_clarification: "being defined",
+};
+
+function pill(status, label) {
+  const good = ["ready", "completed", "sufficient"];
+  const bad = ["failed", "insufficient", "expired", "not_started"];
+  const cls = good.includes(status) ? "ok" : bad.includes(status) ? "bad" : "warn";
+  const text = label || LABELS[status] || String(status).replace(/_/g, " ");
+  return `<span class="pill ${cls}">${esc(text)}</span>`;
+}
+
+function crumbs(parts) {
+  return `<div class="crumb">${parts
+    .map((p) => (p.href ? `<a href="${p.href}">${esc(p.label)}</a>` : esc(p.label)))
+    .join(" › ")}</div>`;
+}
+
+function chat(turns) {
+  return (turns || [])
+    .map((t) => `<div class="msg ${t.role === "assistant" ? "ai" : "me"}">${esc(t.content)}</div>`)
+    .join("");
+}
+
+/** Name a profile the way the employer will recognise it. */
+function profileName(job) {
+  return job.title || job.role_title || job.source_filename || "Untitled profile";
+}
+
+// -- polling ----------------------------------------------------------------
+//
+// Several screens re-render themselves while work finishes. Each render takes a
+// ticket; a scheduled re-render only fires if its ticket is still the current
+// one. Without this, navigating away from a waiting screen leaves its timer
+// running, and it redraws itself over whatever you opened next.
+
+let ticket = 0;
+
+function poll(ms) {
+  const mine = ticket;
+  setTimeout(() => { if (mine === ticket) render(); }, ms);
+}
+
+// ------------------------------------------------------------------- router
+
+function route() {
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [section, id, sub] = raw.split("/");
+  return { section: section || "profiles", id, sub };
+}
+
+function go(path) {
+  location.hash = path;  // fires hashchange -> render
+}
+
+// ------------------------------------------------------------------- login
+
+function renderLogin() {
+  app.innerHTML = `
+    <div class="signin">
+      <img class="logo" src="${esc(config.logo_url)}" alt="${esc(config.bot_name)}: ${esc(config.bot_full_name)}" />
+      <div class="card">
+        <h2>Sign in</h2>
+        <p class="sub">This panel shows every job description, CV and interview
+          transcript. It is not for candidates.</p>
+        <input type="password" id="pw" placeholder="Admin password" autofocus />
+        <button class="primary" id="in" style="width:100%;margin-top:16px">Sign in</button>
+        <div class="err hidden" id="err"></div>
+      </div>
+    </div>`;
+
+  const submit = async () => {
+    const button = document.getElementById("in");
+    button.disabled = true;
+    try {
+      await api("/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: document.getElementById("pw").value }),
+      });
+      render();
+    } catch (e) {
+      button.disabled = false;
+      const err = document.getElementById("err");
+      err.textContent = e.message;
+      err.classList.remove("hidden");
+    }
+  };
+  document.getElementById("in").onclick = submit;
+  document.getElementById("pw").onkeydown = (e) => { if (e.key === "Enter") submit(); };
+}
+
+// -- credentials ------------------------------------------------------------
+//
+// One block, used on both the candidate screen and the session screen, because
+// these are the same three facts and they must not drift apart.
+//
+// Everything here exists to be copied. The employer's job at this point is to
+// get a link, an ID and a password into an email without transcribing them by
+// hand, so each line copies on its own and there is one button that copies the
+// lot as a ready message.
+
+const COPY_ICON = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+  stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+  aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/>
+  <path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>`;
+
+function copyButton(value, label) {
+  return `<button class="copy" data-copy="${esc(value)}"
+    title="Copy ${esc(label)}" aria-label="Copy ${esc(label)}">${COPY_ICON}</button>`;
+}
+
+function credentials(interview) {
+  const url = `${location.origin}/join`;
+  const id = interview.meeting_id || "";
+  const password = interview.password || "";
+  const message =
+    `Interview link: ${url}\n` +
+    `Meeting ID: ${id}\n` +
+    `Password: ${password}`;
+
+  return `
+    <div class="cred">
+      <div class="spread" style="align-items:center">
+        <div class="small muted">Send the candidate</div>
+        <button class="copy-all" data-copy="${esc(message)}">Copy all three</button>
+      </div>
+      <div class="credline">
+        <span class="credlabel">Link</span>
+        <strong>${esc(url)}</strong>
+        ${copyButton(url, "the interview link")}
+      </div>
+      <div class="credline">
+        <span class="credlabel">Meeting ID</span>
+        <strong class="mono">${esc(id)}</strong>
+        ${copyButton(id, "the meeting ID")}
+      </div>
+      <div class="credline">
+        <span class="credlabel">Password</span>
+        <strong class="mono">${esc(password) || '<span class="muted">not available</span>'}</strong>
+        ${password ? copyButton(password, "the password") : ""}
+      </div>
+    </div>`;
+}
+
+/** Copy on click, with the button saying so. Delegated, so it survives every
+ *  re-render without rebinding. */
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-copy]");
+  if (!button) return;
+  const text = button.getAttribute("data-copy");
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Clipboard API needs a secure context. Fall back rather than fail silently.
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.style.position = "fixed";
+    scratch.style.opacity = "0";
+    document.body.appendChild(scratch);
+    scratch.select();
+    document.execCommand("copy");
+    scratch.remove();
+  }
+  const original = button.innerHTML;
+  button.classList.add("copied");
+  button.innerHTML = button.classList.contains("copy-all") ? "Copied" : "✓";
+  setTimeout(() => {
+    button.innerHTML = original;
+    button.classList.remove("copied");
+  }, 1400);
+});
+
+// ---------------------------------------------------------------- profiles
+
+async function viewProfiles() {
+  const profiles = await api("/jobs");
+  app.innerHTML = `
+    <div class="spread">
+      <div><h2>Profiles</h2><p class="sub">One profile per role you are hiring for.</p></div>
+      <div class="row">
+        <a class="btn" href="#/costs">Costs</a>
+        <button data-action="signOut">Sign out</button>
+        <a class="btn primary" href="#/profiles/new">New profile</a>
+      </div>
+    </div>
+    ${profiles.length === 0 ? `<div class="card muted">
+      No profiles yet. Create one by uploading a job description.</div>` : ""}
+    ${profiles.map((p) => `
+      <div class="list-item">
+        <div class="spread">
+          <a href="#/profiles/${p.job_id}" style="flex:1;text-decoration:none;color:inherit">
+            <strong>${esc(profileName(p))}</strong>
+            ${p.business_unit ? `<span class="tag">${esc(p.business_unit)}</span>` : ""}
+            <div class="small muted">
+              ${p.candidate_count} candidate${p.candidate_count === 1 ? "" : "s"}
+              ${p.candidate_count ? ` · ${p.interviewed_count} interviewed` : ""}
+              ${p.stale_count ? ` · <span class="warntext">${p.stale_count} plan${
+                p.stale_count === 1 ? "" : "s"} out of date</span>` : ""}
+              · ${when(p.created_at)}
+            </div>
+          </a>
+          <div class="row">
+            ${pill(p.spec_status)}
+            <button class="danger" data-action="removeProfile" data-id="${esc(p.job_id)}">Delete</button>
+          </div>
+        </div>
+      </div>`).join("")}
+  `;
+}
+
+const removeProfile = async (jobId) => {
+  if (!confirm(
+    "Delete this profile and everything under it: CVs, interview plans and " +
+    "transcripts?\n\nThis cannot be undone."
+  )) return;
+  await api(`/jobs/${jobId}`, { method: "DELETE" });
+  render();
+};
+
+/*  A starting point for the job description, never a replacement for the chat.
+ *
+ *  The template only fills the box. What the interview actually tests is still
+ *  decided by the clarification chat, which runs exactly as it did: the
+ *  employer answers the same questions and the EvaluationSpec is produced the
+ *  same way. Nothing here pre-builds a spec, and nothing here skips a step.
+ *
+ *  Loading it into an editable textarea rather than attaching it as a file is
+ *  the point. A template that could not be changed before the chat would be
+ *  worse than no template, because it would feed the model words the employer
+ *  never meant and every competency after that would be derived from them.
+ *  Writing from scratch and uploading a real file both still work, and an
+ *  uploaded file wins if somebody does both.
+ */
+function viewNewProfile() {
+  app.innerHTML = `
+    ${crumbs([{ label: "Profiles", href: "#/profiles" }, { label: "New profile" }])}
+    <div class="card">
+      <h2>New profile</h2>
+      <p class="sub">Name it, then give us the job description. Mitra reads the JD
+        and asks you a few questions to work out what the interview should test.</p>
+
+      <label class="lbl">What are you hiring for?</label>
+      <input type="text" id="title" placeholder="Business Analyst" autofocus />
+
+      <label class="lbl">Team or business unit <span class="muted">(optional)</span></label>
+      <input type="text" id="bu" placeholder="Payments" />
+      <div class="small muted" style="margin-top:5px">Tells two openings for the
+        same role apart.</div>
+
+      <label class="lbl">Job description</label>
+      <div class="small muted" style="margin-bottom:8px">Start from one of these
+        and edit it, or write your own below, or upload a file.</div>
+      <div class="row" id="tpl" style="flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <span class="muted small">Loading templates…</span>
+      </div>
+      <textarea id="jdtext" rows="14" placeholder="Paste or write the job description here."></textarea>
+      <div class="small muted" style="margin-top:5px" id="tplnote"></div>
+
+      <label class="lbl">Or upload a file <span class="muted">(optional)</span></label>
+      <input type="file" id="jd" accept=".pdf,.docx,.txt,.md" />
+      <div class="small muted" style="margin-top:5px">A file takes precedence over
+        the text above.</div>
+
+      <div class="row" style="margin-top:18px">
+        <button class="primary" id="up">Create profile</button>
+        <span class="muted small" id="status"></span>
+      </div>
+      <div class="err hidden" id="err"></div>
+    </div>`;
+
+  const box = document.getElementById("jdtext");
+  const note = document.getElementById("tplnote");
+  let chosen = "";
+
+  // Templates are a convenience. If the request fails the row says so and the
+  // employer carries on with the textarea and the file input, which are the
+  // two routes that existed before this.
+  api("/jd-templates").then((list) => {
+    const row = document.getElementById("tpl");
+    if (!list.length) { row.innerHTML = `<span class="muted small">No templates.</span>`; return; }
+    row.innerHTML = list
+      .map((t) => `<button type="button" class="tplbtn" data-slug="${esc(t.slug)}">${esc(t.title)}</button>`)
+      .join("");
+    row.querySelectorAll(".tplbtn").forEach((button) => {
+      button.onclick = () => {
+        const template = list.find((t) => t.slug === button.dataset.slug);
+        // Anything already typed is somebody's work. Replacing it silently is
+        // the one move here that loses something that cannot be recovered.
+        if (box.value.trim() && box.value !== chosen &&
+            !confirm("Replace what you have written with this template?")) return;
+        box.value = template.text;
+        chosen = template.text;
+        note.textContent = "Loaded the " + template.title + " template. Edit it before you continue.";
+        const title = document.getElementById("title");
+        if (!title.value.trim()) title.value = template.title;
+        box.focus();
+      };
+    });
+  }).catch(() => {
+    document.getElementById("tpl").innerHTML =
+      `<span class="muted small">Templates could not be loaded. Write or upload a JD instead.</span>`;
+  });
+
+  document.getElementById("up").onclick = async () => {
+    const file = document.getElementById("jd").files[0];
+    const typed = box.value.trim();
+    const err = document.getElementById("err");
+    if (!file && !typed) {
+      err.textContent = "Add a job description, either as text or as a file.";
+      err.classList.remove("hidden");
+      return;
+    }
+    err.classList.add("hidden");
+    document.getElementById("up").disabled = true;
+    document.getElementById("status").textContent = "Reading the job description…";
+    try {
+      const form = new FormData();
+      // The endpoint takes a file, so typed text is sent as one. Named .md
+      // because that is what it is, and because source_filename is what the
+      // panel later shows as the provenance of the spec.
+      form.append("file", file || new File([typed], "job-description.md", { type: "text/markdown" }));
+      form.append("title", document.getElementById("title").value);
+      form.append("business_unit", document.getElementById("bu").value);
+      const created = await api("/jobs", { method: "POST", body: form });
+      go(`/profiles/${created.job_id}`);
+    } catch (e) {
+      document.getElementById("up").disabled = false;
+      document.getElementById("status").textContent = "";
+      err.textContent = e.message;
+      err.classList.remove("hidden");
+    }
+  };
+}
+
+// ----------------------------------------------------------------- profile
+
+async function viewProfile(jobId) {
+  const [job, candidates] = await Promise.all([
+    api(`/jobs/${jobId}`),
+    api(`/jobs/${jobId}/candidates`).catch(() => []),
+  ]);
+  const ready = job.spec_status === "ready";
+  const spec = job.evaluation_spec;
+  const revising = !ready && spec;  // reopened: a spec exists but is being changed
+
+  app.innerHTML = `
+    ${crumbs([{ label: "Profiles", href: "#/profiles" }, { label: profileName(job) }])}
+
+    <div class="card">
+      <div class="spread">
+        <div>
+          <h2 style="margin:0">${esc(profileName(job))}</h2>
+          <div class="small muted" style="margin-top:5px">
+            ${job.business_unit ? `<span class="tag">${esc(job.business_unit)}</span>` : ""}
+            ${spec?.role_title && spec.role_title !== job.title
+              ? esc(spec.role_title) : ""}
+            ${job.spec_version > 1 ? ` · revision ${job.spec_version}` : ""}
+          </div>
+        </div>
+        ${pill(job.spec_status)}
+      </div>
+    </div>
+
+    ${ready ? specCard(spec, jobId) : ""}
+
+    <div class="card">
+      <details ${ready ? "" : "open"}>
+        <summary class="disclosure">
+          <strong>Discussion with Mitra</strong>
+          <span class="muted small">${(job.clarification || []).length} messages${
+            ready ? " · settled" : ""}</span>
+        </summary>
+        <div style="margin-top:14px">
+          ${revising ? `<div class="note">You are changing what this profile
+            tests. When you confirm the new summary, plans for candidates who
+            have not been interviewed will be rebuilt.</div>` : ""}
+          <div class="chat">${chat(job.clarification)}</div>
+          ${ready ? "" : `
+            <textarea id="reply" placeholder="Your answer…"></textarea>
+            <div class="row" style="margin-top:10px">
+              <button class="primary" id="send">Send</button>
+              <span class="muted small" id="status"></span>
+            </div>
+            <div class="err hidden" id="err"></div>`}
+        </div>
+      </details>
+    </div>
+
+    ${ready ? cvsCard(candidates) : ""}
+  `;
+
+  // **A plan finishing does not redraw the list it is listed in.** Blueprint
+  // generation is a BackgroundTask kicked off at CV upload, so this screen is
+  // rendered once with "plan generating" and then never again: the pill stayed
+  // wrong until the row was clicked, because the candidate detail view is the
+  // only one that polls. Not a cache and not a stale poll — a state nobody
+  // refreshed.
+  //
+  // Same ticket mechanism the detail view uses, so navigating away cancels it
+  // rather than redrawing over whatever was opened next.
+  if (candidates.some((c) => ["pending", "generating"].includes(c.blueprint_status))) {
+    poll(2500);
+  }
+
+  if (!ready) {
+    document.getElementById("send").onclick = async () => {
+      const text = document.getElementById("reply").value.trim();
+      if (!text) return;
+      document.getElementById("send").disabled = true;
+      document.getElementById("status").textContent = "Thinking…";
+      try {
+        const reply = await api(`/jobs/${jobId}/clarify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        });
+        if (reply.propagation) announcePropagation(reply.propagation);
+        render();
+      } catch (e) {
+        document.getElementById("send").disabled = false;
+        document.getElementById("status").textContent = "";
+        const err = document.getElementById("err");
+        err.textContent = e.message;
+        err.classList.remove("hidden");
+      }
+    };
+  } else {
+    wireCvUpload(jobId);
+  }
+}
+
+/** Say plainly which candidates a spec change reached, and which it did not. */
+function announcePropagation(p) {
+  const lines = [];
+  if (p.regenerated.length) lines.push(`${p.regenerated.length} interview plan(s) rebuilt.`);
+  if (p.skipped_refined.length) {
+    lines.push(
+      `${p.skipped_refined.length} plan(s) left alone because you had edited them ` +
+      `by hand. They are marked out of date, and you can rebuild them yourself.`
+    );
+  }
+  if (p.skipped_interviewed.length) {
+    lines.push(
+      `${p.skipped_interviewed.length} candidate(s) already interviewed were not ` +
+      `touched. Their plan is the record of what they were actually asked.`
+    );
+  }
+  if (lines.length) alert(lines.join("\n\n"));
+}
+
+function specCard(spec, jobId) {
+  const total = spec.competencies.reduce((a, c) => a + c.weight, 0) || 1;
+  return `
+    <div class="card">
+      <div class="spread">
+        <h3 style="margin:0">What this interview tests</h3>
+        <button data-action="reopenSpec" data-id="${esc(jobId)}">Change this</button>
+      </div>
+      <div class="kv" style="margin-top:14px">
+        <div>Seniority</div><div>${esc(spec.seniority)}</div>
+        <div>Experience</div><div>${esc(spec.experience_expectation)}</div>
+        <div>Length</div>
+        <div>${spec.duration_minutes} min
+          <span class="muted small">(${DURATION_MIN} to ${DURATION_MAX} allowed)</span></div>
+      </div>
+      <h3>Competencies</h3>
+      ${spec.competencies.map((c) => `
+        <div style="margin-bottom:12px">
+          <div class="spread">
+            <strong>${esc(c.name)}</strong>
+            <span class="muted small">${(c.weight * 100).toFixed(0)}%</span>
+          </div>
+          <div class="bar" style="width:${(c.weight / total) * 100}%;margin:5px 0"></div>
+          <div class="small muted">${esc(c.description)}</div>
+        </div>`).join("")}
+      ${spec.red_flags?.length ? `<h3>Dealbreakers</h3>
+        <ul class="small muted" style="margin:0;padding-left:19px">
+          ${spec.red_flags.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
+    </div>`;
+}
+
+const reopenSpec = async (jobId) => {
+  if (!confirm(
+    "Reopen the discussion to change what this interview tests?\n\n" +
+    "When you confirm a new summary, plans are rebuilt for candidates who have " +
+    "not been interviewed yet. Candidates you have already interviewed, and " +
+    "plans you edited by hand, are left as they are."
+  )) return;
+  await api(`/jobs/${jobId}/reopen`, { method: "POST" });
+  render();
+};
+
+function cvsCard(candidates) {
+  return `
+    <div class="card">
+      <h3 style="margin-top:0">Candidates</h3>
+      <p class="sub" style="margin-top:6px">Upload a CV. An interview plan is
+        built for that person straight away.</p>
+      <input type="file" id="cv" accept=".pdf,.docx,.txt,.md" />
+      <div class="row" style="margin:14px 0">
+        <button class="primary" id="upcv">Upload CV</button>
+        <span class="muted small" id="cvstatus"></span>
+      </div>
+      <div class="err hidden" id="cverr"></div>
+      ${candidates.length === 0 ? `<div class="muted small">Nobody yet.</div>` : ""}
+      ${candidates.map((c) => `
+        <a class="list-item" href="#/candidates/${c.candidate_id}"
+           style="display:block;text-decoration:none;color:inherit">
+          <div class="spread">
+            <div>
+              <strong>${esc(c.name || c.source_filename || "Candidate")}</strong>
+              ${c.plan_is_stale ? `<span class="tag warn">plan out of date</span>` : ""}
+              <div class="small muted">${when(c.created_at)}</div>
+              ${c.blueprint_error ? `<div class="small err">${esc(c.blueprint_error)}</div>` : ""}
+            </div>
+            <div class="row">
+              ${c.blueprint_status === "ready"
+                ? pill(c.interview_status)
+                : pill(c.blueprint_status, `plan ${c.blueprint_status}`)}
+            </div>
+          </div>
+        </a>`).join("")}
+    </div>`;
+}
+
+function wireCvUpload(jobId) {
+  const button = document.getElementById("upcv");
+  if (!button) return;
+  button.onclick = async () => {
+    const file = document.getElementById("cv").files[0];
+    if (!file) return;
+    button.disabled = true;
+    document.getElementById("cvstatus").textContent = "Reading the CV and building the plan…";
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      await api(`/jobs/${jobId}/candidates`, { method: "POST", body: form });
+      poll(1500);
+    } catch (e) {
+      button.disabled = false;
+      document.getElementById("cvstatus").textContent = "";
+      const err = document.getElementById("cverr");
+      err.textContent = e.message;
+      err.classList.remove("hidden");
+    }
+  };
+}
+
+// --------------------------------------------------- candidate + the plan
+
+async function viewCandidate(candidateId) {
+  const [candidate, interviews] = await Promise.all([
+    api(`/candidates/${candidateId}`),
+    api(`/candidates/${candidateId}/interviews`),
+  ]);
+
+  const backToProfile = `#/profiles/${candidate.job_id}`;
+
+  if (candidate.blueprint_status !== "ready") {
+    app.innerHTML = `
+      ${crumbs([
+        { label: "Profiles", href: "#/profiles" },
+        { label: "Profile", href: backToProfile },
+        { label: "Candidate" },
+      ])}
+      <div class="card">
+        <h2>Building the interview plan…</h2>
+        <p class="sub">${pill(candidate.blueprint_status)}
+          ${candidate.error ? esc(candidate.error) : "Usually under a minute."}</p>
+      </div>`;
+    if (candidate.blueprint_status !== "failed") poll(2500);
+    return;
+  }
+
+  const bp = candidate.blueprint;
+  // At most one session is open at a time; anything else is history.
+  const open = interviews.find((i) => ["scheduled", "in_progress"].includes(i.status));
+  const past = interviews.filter((i) => i !== open);
+
+  app.innerHTML = `
+    ${crumbs([
+      { label: "Profiles", href: "#/profiles" },
+      { label: bp.evaluation_spec.role_title, href: backToProfile },
+      { label: bp.candidate_name || "Candidate" },
+    ])}
+
+    <div class="card">
+      <h2 style="margin:0">${esc(bp.candidate_name || "Candidate")}</h2>
+      <p class="sub" style="margin:10px 0 0">${esc(bp.candidate_summary || "")}</p>
+    </div>
+
+    ${candidate.plan_is_stale ? `<div class="card note">
+      <strong>This plan is out of date.</strong>
+      It was built before you changed what this profile tests. It was kept
+      because you had edited it by hand. Rebuilding it would have discarded
+      your edits. Ask for the change again below, or delete and re-upload the CV
+      to start from the current spec.
+    </div>` : ""}
+
+    <div class="card">
+      <div class="spread">
+        <h3 style="margin:0">Session</h3>
+        ${open ? "" : `<button class="primary" id="start">Start interview</button>`}
+      </div>
+      ${open ? `
+        ${credentials(open)}
+        <div class="row" style="margin-top:14px">
+          <a class="btn" href="#/interviews/${open.interview_id}">Open session</a>
+          ${open.status === "scheduled"
+            ? `<button class="danger" data-action="cancelSession" data-id="${esc(open.interview_id)}">Cancel</button>`
+            : ""}
+          ${pill(open.status)}
+        </div>
+        <p class="small muted" style="margin-bottom:0">
+          One session at a time. Start another once this one has finished.</p>
+      ` : `<p class="sub" style="margin:10px 0 0">No session yet. Starting one
+        creates the link, meeting ID and password to send the candidate.</p>`}
+      <div class="err hidden" id="starterr"></div>
+    </div>
+
+    ${past.length ? `<div class="card">
+      <h3 style="margin-top:0">Earlier sessions</h3>
+      ${past.map((i) => `
+        <a class="list-item" href="#/interviews/${i.interview_id}"
+           style="display:block;text-decoration:none;color:inherit">
+          <div class="spread">
+            <div><strong class="mono">${esc(i.meeting_id)}</strong>
+              <div class="small muted">${when(i.created_at)}</div></div>
+            ${pill(i.status)}
+          </div>
+        </a>`).join("")}
+    </div>` : ""}
+
+    <div class="card">
+      <h3 style="margin-top:0">The plan for this candidate</h3>
+      ${bp.claims_to_verify?.length ? `
+        <p class="small muted" style="margin:10px 0 4px">Claims it will test:</p>
+        <ul class="small" style="margin:0;padding-left:19px">
+          ${bp.claims_to_verify.map((c) => `<li>${esc(c.claim)}</li>`).join("")}</ul>` : ""}
+      <div class="turn" style="margin-top:14px">
+        <span class="who">${bp.opening_minutes} min</span> · Opening and warm-up</div>
+      ${bp.competency_plans.map((p) => `
+        <div class="turn">
+          <span class="who">${p.time_budget_minutes} min · ${esc(p.name)}</span>
+          <div class="small muted" style="margin:4px 0">${esc(p.target_depth)}</div>
+          <details><summary class="small muted" style="cursor:pointer">
+            ${p.seed_questions.length} questions</summary>
+            <ul class="small" style="margin:8px 0 0;padding-left:19px">
+              ${p.seed_questions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul>
+          </details>
+        </div>`).join("")}
+      <div class="turn"><span class="who">${bp.closing_minutes} min</span> · Closing</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Improve the plan</h3>
+      <p class="sub" style="margin-top:6px">Tell Mitra what to change: "spend less
+        time on mentoring", "push harder on the pricing claim", "that question is unfair".</p>
+      <div class="chat">${chat(candidate.refinements)}</div>
+      <textarea id="refine" placeholder="What should change?"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="dorefine">Update plan</button>
+        <span class="muted small" id="refstatus"></span>
+      </div>
+      <div class="err hidden" id="referr"></div>
+    </div>
+  `;
+
+  const startButton = document.getElementById("start");
+  if (startButton) {
+    startButton.onclick = async () => {
+      startButton.disabled = true;
+      try {
+        const started = await api(`/candidates/${candidateId}/interviews`, { method: "POST" });
+        go(`/interviews/${started.interview_id}`);
+      } catch (e) {
+        startButton.disabled = false;
+        const err = document.getElementById("starterr");
+        err.textContent = e.message;
+        err.classList.remove("hidden");
+      }
+    };
+  }
+
+  document.getElementById("dorefine").onclick = async () => {
+    const text = document.getElementById("refine").value.trim();
+    if (!text) return;
+    document.getElementById("dorefine").disabled = true;
+    document.getElementById("refstatus").textContent = "Rewriting the plan…";
+    try {
+      await api(`/candidates/${candidateId}/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text }),
+      });
+      render();
+    } catch (e) {
+      document.getElementById("dorefine").disabled = false;
+      document.getElementById("refstatus").textContent = "";
+      const err = document.getElementById("referr");
+      err.textContent = e.message;
+      err.classList.remove("hidden");
+    }
+  };
+}
+
+const cancelSession = async (interviewId) => {
+  if (!confirm(
+    "Cancel this session?\n\nThe meeting ID and password stop working. You can " +
+    "start a new session afterwards."
+  )) return;
+  await api(`/interviews/${interviewId}`, { method: "DELETE" });
+  render();
+};
+
+// --------------------------------------------------------------- interview
+
+async function viewInterview(interviewId) {
+  const iv = await api(`/interviews/${interviewId}`);
+  const metrics = iv.session_metrics || {};
+  const latency = metrics.latency_summary || {};
+  const done = ["completed", "failed"].includes(iv.status);
+
+  app.innerHTML = `
+    ${crumbs([
+      { label: "Profiles", href: "#/profiles" },
+      { label: "Candidate", href: `#/candidates/${iv.candidate_id}` },
+      { label: "Session" },
+    ])}
+
+    <div class="card">
+      <div class="spread"><h2 style="margin:0">Interview session</h2>${pill(iv.status)}</div>
+      ${credentials(iv)}
+      ${iv.failure_reason ? `<div class="err">${esc(iv.failure_reason)}</div>` : ""}
+    </div>
+
+    ${done ? reportCard(iv) : ""}
+    ${done ? recordingCard(iv) : ""}
+    ${done ? brainCard(iv, metrics, latency) : `<div class="card muted">
+      Waiting for the candidate to join. Mitra starts when they do, and this page
+      refreshes on its own.</div>`}
+  `;
+
+  wireRecording(iv);
+
+  const retry = document.getElementById("rescore");
+  if (retry) {
+    retry.onclick = async () => {
+      // Only warn when there is a report to lose. Scores can shift between
+      // runs on the same transcript, and someone may already have acted on the
+      // one on screen.
+      if (iv.feedback_report && !confirm(
+        "Rebuild this report from the transcript?\n\n" +
+        "It is scored again from the same conversation, so wording and scores " +
+        "may come out slightly differently. The current report is replaced."
+      )) return;
+      retry.disabled = true;
+      await api(`/interviews/${interviewId}/feedback`, { method: "POST" });
+      render();
+    };
+  }
+
+  // Poll while the interview is live, while scoring is still running, and while
+  // the recording is still on its way over from the video service.
+  if (!done) poll(5000);
+  else if (["pending", "generating"].includes(iv.feedback_status)) poll(4000);
+  else if (iv.recording_status === "recording") poll(15000);
+}
+
+// -- the recording ----------------------------------------------------------
+//
+// For a person to watch. It is not scored, nothing reads it, and no model sees
+// it: it is here so a reviewer can hear how an answer was given, and judge
+// things a transcript cannot show them, including whether somebody had help.
+//
+// **When there is no recording, this says so in words.** Every branch below
+// ends in a sentence rather than an empty player. A video element with a broken
+// source looks like a bug in the panel, and a reviewer who cannot tell "there is
+// no recording" from "the recording will not load" has been told nothing.
+
+function recordingCard(iv) {
+  const status = iv.recording_status || "not_recorded";
+
+  if (status === "stored") {
+    const size = iv.recording_bytes
+      ? ` · ${(iv.recording_bytes / 1e6).toFixed(0)} MB` : "";
+    return `<div class="card">
+      <div class="spread">
+        <h3 style="margin:0">Watch it back</h3>
+        <button id="rec-delete" class="danger">Delete recording</button>
+      </div>
+      <video id="rec" controls preload="metadata" playsinline
+             style="width:100%;margin-top:12px;border-radius:8px;background:#000"
+             src="/interviews/${esc(iv.interview_id)}/recording/video"></video>
+      <p class="small muted" style="margin-bottom:0">
+        ${iv.recording_expires_at
+          ? `Kept until ${esc(when(iv.recording_expires_at))}, then deleted automatically.`
+          : `Kept for ${RETENTION_DAYS} days, then deleted automatically.`}${size}
+        Click any line of the transcript below to jump to that moment.</p>
+    </div>`;
+  }
+
+  if (status === "recording") {
+    return `<div class="card muted">
+      <h3 style="margin-top:0">Watch it back</h3>
+      <p style="margin-bottom:0">The recording is still being put together by the
+        video service. It usually takes a few minutes after the interview ends,
+        and this page checks on its own.</p>
+    </div>`;
+  }
+
+  if (status === "unavailable") {
+    return `<div class="card note">
+      <h3 style="margin-top:0">There is no recording of this interview</h3>
+      <p class="small muted" style="margin-bottom:0">${esc(
+        iv.recording_error || "The recording did not happen and no reason was recorded.")}
+        The transcript and the report are unaffected.</p>
+    </div>`;
+  }
+
+  if (status === "deleted") {
+    return `<div class="card muted">
+      <h3 style="margin-top:0">The recording was deleted</h3>
+      <p style="margin-bottom:0">Somebody deleted it${
+        iv.recording_deleted_at ? ` on ${esc(when(iv.recording_deleted_at))}` : ""
+      }. It cannot be recovered. The transcript is still here.</p>
+    </div>`;
+  }
+
+  if (status === "expired") {
+    return `<div class="card muted">
+      <h3 style="margin-top:0">The recording has been deleted</h3>
+      <p style="margin-bottom:0">Recordings are kept for ${RETENTION_DAYS} days and
+        this one has passed that${
+          iv.recording_deleted_at ? `, on ${esc(when(iv.recording_deleted_at))}` : ""
+        }. The transcript is still here.</p>
+    </div>`;
+  }
+
+  return `<div class="card muted">
+    <h3 style="margin-top:0">This interview was not recorded</h3>
+    <p style="margin-bottom:0">It ran before recording existed, so there is
+      nothing to watch back. The transcript is below.</p>
+  </div>`;
+}
+
+function wireRecording(iv) {
+  const video = document.getElementById("rec");
+
+  // A transcript line seeks the video. The offset is the gap between the
+  // transcript's clock, which starts when the bot process does, and the video's,
+  // which starts a moment later when it reaches the room. Without subtracting it
+  // every jump lands slightly early, and "slightly" is a whole answer when turns
+  // are short.
+  if (video) {
+    const offset = iv.recording_offset_seconds || 0;
+    for (const line of document.querySelectorAll("[data-at]")) {
+      line.addEventListener("click", () => {
+        video.currentTime = Math.max(0, Number(line.dataset.at) - offset);
+        video.play();
+        video.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }
+  }
+
+  const remove = document.getElementById("rec-delete");
+  if (!remove) return;
+  remove.onclick = async () => {
+    if (!confirm(
+      "Delete the recording of this interview?\n\n" +
+      "The video file is removed for good and cannot be recovered. The " +
+      "transcript and the report are not affected."
+    )) return;
+    remove.disabled = true;
+    remove.textContent = "Deleting...";
+    try {
+      await api(`/interviews/${iv.interview_id}/recording`, { method: "DELETE" });
+    } catch (e) {
+      // The recording is still there. Say that, rather than leaving a disabled
+      // button that reads as though something happened.
+      remove.disabled = false;
+      remove.textContent = "Delete recording";
+      alert(`The recording was not deleted.\n\n${e.message}`);
+      return;
+    }
+    render();
+  };
+}
+
+// -- the report -------------------------------------------------------------
+//
+// Scores and the evidence behind them come first; the written assessment sits
+// at the bottom. A reader who only looks at the top should see what the
+// transcript actually supports, not a paragraph telling them what to think.
+
+const SIGNAL_TEXT = {
+  strong_evidence_for: "Strong evidence gathered",
+  some_evidence_for: "Some evidence gathered",
+  mixed: "Mixed evidence",
+  limited_evidence: "Limited evidence gathered",
+  insufficient_signal: "Not enough signal to judge",
+};
+
+function reportCard(iv) {
+  if (iv.feedback_status === "failed") {
+    return `<div class="card note">
+      <div class="spread">
+        <div>
+          <strong>Scoring did not complete.</strong>
+          <div class="small muted" style="margin-top:4px">${esc(iv.feedback_error || "")}</div>
+        </div>
+        <button id="rescore">Try again</button>
+      </div>
+      <p class="small muted" style="margin-bottom:0">The transcript is saved and
+        unaffected. Only the report needs rebuilding.</p>
+    </div>`;
+  }
+  // A report that was scored and saved, but could not be read back against the
+  // current shape, arrives as null with the status still "ready". Saying
+  // "scoring the transcript" there would be a system failure wearing the look
+  // of a normal state: nobody retries, nobody looks.
+  if (!iv.feedback_report && iv.feedback_status === "ready") {
+    return `<div class="card note">
+      <div class="spread">
+        <div>
+          <strong>This report could not be opened.</strong>
+          <div class="small muted" style="margin-top:4px">It was saved in an
+            older format that no longer matches how reports are read. Rebuilding
+            it from the transcript will fix it.</div>
+        </div>
+        <button id="rescore">Rebuild report</button>
+      </div>
+      <p class="small muted" style="margin-bottom:0">The transcript and the
+        session record are unaffected, and are shown below.</p>
+    </div>`;
+  }
+  if (!iv.feedback_report) {
+    return `<div class="card muted">
+      Scoring the transcript… this page updates itself.
+      <span class="small">(${esc(iv.feedback_status)})</span></div>`;
+  }
+
+  const r = iv.feedback_report;
+  const health = r.conversation_health;
+  // Three independent degradations: the recording, our own analysis of it, and
+  // how the interview was conducted. All three render, in that order, and none
+  // hides another — a report can be degraded on every count and a reader has to
+  // see each reason separately.
+  //
+  // The third was derived, attached to the report and used to cap the
+  // recommendation for a week while never reaching this file, so the one thing
+  // it exists to tell a recruiter — that thin answers may be the interviewer
+  // repeating itself rather than the candidate having nothing — was the one
+  // thing they could not read. `banner()` was already generic over any health
+  // object; only this list was not.
+  const analysis = r.judgment_health;
+  const questioning = r.questioning_health;
+  const scored = r.competency_scores.filter((s) => s.score !== null);
+  const average = scored.length
+    ? scored.reduce((a, s) => a + s.score, 0) / scored.length
+    : null;
+  const rebuilding = ["pending", "generating"].includes(iv.feedback_status);
+
+  return `
+    <div class="card">
+      <div class="spread">
+        <div>
+          <h3 style="margin:0">Assessment</h3>
+          <div class="small muted" style="margin-top:4px">
+            ${esc(r.role_title)} · ${scored.length} of ${r.competency_scores.length}
+            competencies evidenced
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div class="score-big">${average === null
+            ? `n/a`
+            : `${average.toFixed(1)}<span class="score-max">/5</span>`}</div>
+          <div class="small muted">${esc(SIGNAL_TEXT[r.recommendation] || r.recommendation)}</div>
+        </div>
+      </div>
+      <p class="small muted" style="margin:14px 0 0">
+        Evidence for a person to weigh, not a hiring decision. Every score below
+        is backed by quotes you can check against the transcript.</p>
+      ${banner(health)}
+      ${banner(analysis)}
+      ${banner(questioning)}
+      ${focusLine(iv)}
+      <div class="spread" style="margin-top:16px;align-items:center">
+        <span class="small muted">
+          ${rebuilding
+            ? "Recomputing from the transcript…"
+            : iv.feedback_generated_at
+              ? `Generated ${when(iv.feedback_generated_at)}`
+              : "Generated from the saved transcript"}
+          ${/* How long the interview actually ran, next to what the report cannot
+                tell you rather than on its own. A thin report reads differently
+                when the interview was eleven minutes of a planned twenty, and
+                that is the only question this number answers. */ ""}
+          ${!rebuilding && r.interview_duration_seconds
+            ? ` · interview ran ${Math.round(r.interview_duration_seconds / 60)} min`
+            : ""}
+        </span>
+        <button id="rescore" ${rebuilding ? "disabled" : ""}>Regenerate</button>
+      </div>
+    </div>
+
+    ${r.competency_scores.map(competencyCard).join("")}
+
+    ${dealbreakerCard(r)}
+
+    ${r.contradictions?.length ? `<div class="card">
+      <h3 style="margin-top:0">Inconsistencies noted</h3>
+      <p class="small muted" style="margin-top:0">Recorded for you to weigh.
+        People misremember; this is not an accusation.</p>
+      ${r.contradictions.map((c) => `
+        <div class="turn small">
+          <div class="muted">Earlier: ${esc(c.earlier_claim)}</div>
+          <div class="muted">Later: ${esc(c.later_statement)}</div>
+          ${c.probed ? `<div class="small">Mitra asked about this during the interview.</div>` : ""}
+        </div>`).join("")}
+    </div>` : ""}
+
+    ${r.coverage_gaps?.length ? `<div class="card note">
+      <strong>What this report cannot tell you</strong>
+      <ul class="small" style="margin:8px 0 0;padding-left:19px">
+        ${r.coverage_gaps.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>
+    </div>` : ""}
+
+    <div class="card">
+      <h3 style="margin-top:0">Written summary</h3>
+      <p style="margin-bottom:0;white-space:pre-wrap">${esc(r.summary)}</p>
+    </div>`;
+}
+
+/** One "read this first" banner, from a health record on the report.
+ *
+ *  The sentence is written once, in shared/contracts.py, and sent. The panel
+ *  used to compose its own copy of the recording-quality one, which drifted:
+ *  the scoring model was told one wording and the employer read another, both
+ *  claiming to describe the same recording. Render what you are given.
+ */
+/*  When the interview page was not in front of the candidate.
+ *
+ *  Context beside the report, not a finding inside it. It is deliberately the
+ *  plainest thing on this screen: a count, a duration, and no verdict. No
+ *  score, no threshold, no percentage and no colour that implies one, because
+ *  a number here would suggest a model nobody has validated, and ten stored
+ *  interviews with no real cheating in them cannot validate one.
+ *
+ *  It also catches only the same-device case. A phone, a second monitor with
+ *  the browser still focused, or somebody else in the room produce nothing at
+ *  all, so a clean line here is not evidence of anything and the wording must
+ *  never suggest it is.
+ *
+ *  Silent when the page was never left. An absence is not a result, and a row
+ *  reading "0 times" would turn one into one.
+ */
+function focusLine(iv) {
+  const events = iv.focus_events || [];
+  if (!events.length) return "";
+  const total = Math.round(events.reduce((a, e) => a + (e.seconds || 0), 0));
+  const spell = total >= 90
+    ? `${Math.round(total / 60)} minutes`
+    : `${total} second${total === 1 ? "" : "s"}`;
+  const times = events.length === 1 ? "once" : `${events.length} times`;
+  return `<p class="small muted" style="margin:14px 0 0">
+    The interview page was out of view ${times}, ${esc(spell)} in total. The
+    candidate was told this is recorded. It shows only what happened on this
+    device, so it says nothing about a second screen, a phone, or anyone else
+    in the room.</p>`;
+}
+
+function banner(health) {
+  if (!health || !health.degraded || !health.as_sentence) return "";
+  return `<div class="note" style="margin:14px 0 0">
+    <strong>Read this first.</strong> ${esc(health.as_sentence)}</div>`;
+}
+
+/**
+ *  Every dealbreaker the employer named, and which of three the interview could
+ *  say about it.
+ *
+ *  `red_flags_observed` only ever held what fired, so silence meant "we asked
+ *  and they were fine" or "nobody looked" and a reader could not tell which.
+ *  Across 24 stored reports one dealbreaker fired in 10 and the other three
+ *  fired zero times, with nothing recording whether they were cleared or never
+ *  put.
+ *
+ *  The three states are given different weight on purpose, because they are
+ *  different kinds of fact:
+ *
+ *    observed     a finding about the candidate. Quoted, and marked like a
+ *                 failure, because that is what the employer said it was.
+ *    cleared      reassurance. Quoted too, held to the same evidence standard,
+ *                 and marked as settled rather than merely absent.
+ *    not reached  a limitation of the INTERVIEW. Muted, unquoted, and it says
+ *                 in words that it is not a mark against the candidate. The
+ *                 same distinction `questioning_health` exists for.
+ *
+ *  `as_sentence` comes from the contract so the wording lives in one place; the
+ *  panel used to compose its own copy of the recording-quality sentence and it
+ *  drifted three ways.
+ *
+ *  Falls back to the old card for reports scored before the field existed,
+ *  which are still in the database and still readable.
+ */
+function dealbreakerCard(r) {
+  if (!r.dealbreakers?.length) {
+    if (!r.red_flags_observed?.length) return "";
+    return `<div class="card">
+      <h3 style="margin-top:0">Dealbreakers observed</h3>
+      ${r.red_flags_observed.map((f) => `
+        <div class="turn">
+          <strong>${esc(f.description)}</strong>
+          ${f.evidence.map(quoteBlock).join("")}
+        </div>`).join("")}
+    </div>`;
+  }
+
+  const mark = { observed: "bad", cleared: "ok", not_reached: "warn" };
+  const label = { observed: "observed", cleared: "addressed", not_reached: "not reached" };
+
+  return `<div class="card">
+    <h3 style="margin-top:0">Dealbreakers</h3>
+    <p class="small muted" style="margin-top:0">Everything the employer said
+      would rule someone out, and what this interview could establish.</p>
+    ${r.dealbreakers.map((d) => `
+      <div class="turn">
+        <div class="spread" style="align-items:flex-start;gap:10px">
+          <strong ${d.state === "not_reached" ? `class="muted"` : ""}>${esc(d.dealbreaker)}</strong>
+          <span class="pill ${mark[d.state] || "warn"}">${esc(label[d.state] || d.state)}</span>
+        </div>
+        <div class="small muted" style="margin-top:4px">${esc(d.as_sentence)}</div>
+        ${(d.evidence || []).map(quoteBlock).join("")}
+      </div>`).join("")}
+  </div>`;
+}
+
+function competencyCard(s) {
+  const pct = s.score === null ? 0 : (s.score / 5) * 100;
+  return `
+    <div class="card">
+      <div class="spread">
+        <div>
+          <strong>${esc(s.name)}</strong>
+          <div class="small muted" style="margin-top:3px">${esc(s.rationale)}</div>
+        </div>
+        <div style="text-align:right;min-width:74px">
+          ${s.score === null
+            ? `<span class="pill warn">no signal</span>`
+            : `<div class="score-mid">${s.score.toFixed(1)}<span class="score-max">/5</span></div>`}
+        </div>
+      </div>
+      ${s.score === null ? "" : `
+        <div class="meter"><div class="meter-fill" style="width:${pct}%"></div></div>`}
+      ${s.evidence?.length ? `
+        <details style="margin-top:12px">
+          <summary class="small muted" style="cursor:pointer">
+            ${s.evidence.length} quote${s.evidence.length === 1 ? "" : "s"} from the transcript</summary>
+          ${s.evidence.map(quoteBlock).join("")}
+        </details>` : ""}
+    </div>`;
+}
+
+function quoteBlock(q) {
+  return `<blockquote class="quote">
+    “${esc(q.text)}”
+    <span class="small muted">${Math.floor(q.at_seconds / 60)}:${
+      String(Math.round(q.at_seconds % 60)).padStart(2, "0")}, turn ${q.turn_index}</span>
+  </blockquote>`;
+}
+
+// How long the interviewer took to answer, said in a way that cannot mislead.
+//
+// **The number here used to be a median, and a median cannot describe this.**
+// A turn ends one of two ways: the turn model was confident and the interviewer
+// answers in about 1.7s, or it was unsure and waits out the four second
+// fallback before answering in about 5.4s. Across five real interviews both
+// modes were identical every time; only the proportion moved. When it crossed
+// one half the median stepped from 2.04s to 5.27s and this panel reported a
+// 2.6x regression in a system nobody had touched.
+//
+// So it shows the speed when the interviewer was ready to answer, which is the
+// system, and separately how often it waited, which is the candidate. Those are
+// different facts and the old line could not tell them apart. The mean is given
+// as the overall figure because it moves with the mix rather than jumping
+// across it.
+function responseTime(latency) {
+  const ready = latency.ttfa_median_ready_ms;
+  const mean = latency.ttfa_mean_ms;
+  if (ready == null && mean == null) {
+    return latency.ttfa_median_ms
+      ? `${(latency.ttfa_median_ms / 1000).toFixed(2)}s median`
+      : "n/a";
+  }
+  const share = latency.fallback_share;
+  const secs = (ms) => `${(ms / 1000).toFixed(2)}s`;
+  // No waiting at all: one number is the whole truth, so say only that.
+  if (!share) return `${secs(ready ?? mean)} when ready`;
+  const waited = Math.round(share * 100);
+  return `${secs(ready)} when ready, ${secs(mean)} overall`
+    + `<div class="small muted">waited to be sure on ${waited}% of turns`
+    + `${latency.ttfa_median_waiting_ms
+        ? `, ${secs(latency.ttfa_median_waiting_ms)} on those` : ""}</div>`;
+}
+
+
+function brainCard(iv, metrics, latency) {
+  const turns = iv.transcript?.turns || [];
+  const outcomes = (iv.section_outcomes || []).filter((o) => o.turns_spent > 0);
+  const events = metrics.brain_events || [];
+  // Only make lines clickable when there is something for them to seek. A
+  // pointer cursor over text that does nothing is a worse offence than no
+  // feature at all.
+  const seekable = iv.recording_status === "stored";
+
+  return `
+    <div class="card">
+      <h3 style="margin-top:0">How it went</h3>
+      <div class="kv">
+        <div>Length</div><div>${((iv.transcript?.duration_seconds || 0) / 60).toFixed(1)} min</div>
+        <div>Turns</div><div>${turns.length}</div>
+        <div>Response time</div>
+        <div>${responseTime(latency)}</div>
+        <div>Longest pause tolerated</div>
+        <div>${latency.longest_tolerated_pause_s == null
+          ? "n/a" : `${latency.longest_tolerated_pause_s}s`}</div>
+        <div>Model</div><div class="mono small">${esc(metrics.llm_model || "n/a")}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">What Mitra decided</h3>
+      ${outcomes.map((o) => `
+        <div class="turn">
+          <div class="spread"><strong>${esc(o.section_id)}</strong>${pill(o.coverage)}</div>
+          <div class="small muted">
+            ${o.turns_spent} turns · ${Math.round(o.seconds_spent)}s of ${Math.round(o.budget_seconds)}s
+            ${o.declined_turns ? ` · ${o.declined_turns} declined` : ""}
+          </div>
+          ${o.shortfall_reason ? `<div class="small err">${esc(o.shortfall_reason)}</div>` : ""}
+          ${o.key_claims?.length ? `<ul class="small" style="margin:7px 0 0;padding-left:19px">
+            ${o.key_claims.map((c) => `<li>${esc(c.text)}</li>`).join("")}</ul>` : ""}
+          ${(o.contradictions || []).map((c) => `
+            <div class="small" style="margin-top:7px">
+              <span class="pill warn">inconsistency</span>
+              <div class="muted">Earlier: ${esc(c.earlier_claim)}</div>
+              <div class="muted">Later: ${esc(c.later_statement)}</div>
+            </div>`).join("")}
+        </div>`).join("")}
+    </div>
+
+    ${events.length ? `<div class="card">
+      <h3 style="margin-top:0">Decisions timeline</h3>
+      <pre>${esc(events.map((e) =>
+        `${String(Math.round(e.at_seconds)).padStart(4)}s  ${e.kind.padEnd(16)} ${
+          JSON.stringify(Object.fromEntries(
+            Object.entries(e).filter(([k]) => !["kind", "at_seconds"].includes(k))))}`
+      ).join("\n"))}</pre></div>` : ""}
+
+    <div class="card">
+      <h3 style="margin-top:0">Transcript</h3>
+      ${turns.map((t) => `
+        <div class="turn${seekable ? " seekable" : ""}"${
+          seekable ? ` data-at="${t.at_seconds}" title="Jump to this moment"` : ""}>
+          <span class="who ${t.speaker === "interviewer" ? "int" : ""}">
+            ${t.speaker === "interviewer" ? "Mitra" : "Candidate"}</span>
+          <span class="muted small">${Math.round(t.at_seconds)}s</span>
+          <div>${esc(t.text)}</div>
+        </div>`).join("")}
+    </div>`;
+}
+
+// ------------------------------------------------------------------ render
+
+async function render() {
+  ticket += 1;  // cancels any re-render the previous screen had scheduled
+  const { section, id } = route();
+  try {
+    const { signed_in } = await api("/admin/session");
+    if (!signed_in) return renderLogin();
+
+    if (section === "profiles" && id === "new") viewNewProfile();
+    else if (section === "profiles" && id) await viewProfile(id);
+    else if (section === "profiles") await viewProfiles();
+    else if (section === "candidates" && id) await viewCandidate(id);
+    else if (section === "interviews" && id) await viewInterview(id);
+    else if (section === "costs") await viewCosts();
+    else go("/profiles");
+  } catch (e) {
+    if (e.message === "Signed out.") return;
+    app.innerHTML = `<div class="card"><h2>Something went wrong</h2>
+      <p class="sub">${esc(e.message)}</p>
+      <a class="btn" href="#/profiles">Back to profiles</a></div>`;
+  }
+}
+
+const signOut = async () => {
+  await api("/admin/logout", { method: "POST" });
+  go("/profiles");
+  renderLogin();
+};
+
+// Buttons that act rather than navigate. Looked up at click time, so the order the
+// functions are declared in does not matter.
+const ACTIONS = {
+  signOut: () => signOut(),
+  removeProfile: (id) => removeProfile(id),
+  reopenSpec: (id) => reopenSpec(id),
+  cancelSession: (id) => cancelSession(id),
+};
+
+app.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-action]");
+  if (!button || !app.contains(button)) return;
+  const action = ACTIONS[button.dataset.action];
+  if (action) action(button.dataset.id);
+});
+
+// ------------------------------------------------------------------- costs
+
+const money = (value) => (value == null ? "not priced" : `$${value.toFixed(4)}`);
+
+function costRow(iv) {
+  const tone = iv.complete ? "ok" : iv.has_usage ? "warn" : "";
+  const label = iv.complete ? "priced" : iv.has_usage ? "partly priced" : "no usage";
+  const usage = iv.has_usage
+    ? ` · ${iv.call_minutes} min call · ${iv.llm_calls} model calls · ${iv.tts_characters} speech chars`
+    : "";
+  const estimate = iv.has_usage
+    ? `<div class="small">Estimate: <strong>${money(iv.estimate_usd)}</strong>${
+        iv.notes.length
+          ? `<div class="small muted">${iv.notes.map((n) => `<div>${esc(n)}</div>`).join("")}</div>`
+          : ""
+      }</div>`
+    : "";
+  return `
+    <div class="list-item">
+      <div class="spread">
+        <a href="#/interviews/${esc(iv.id)}" class="mono small" style="text-decoration:none;color:inherit">${esc(iv.id)}</a>
+        <span class="pill ${tone}">${label}</span>
+      </div>
+      <div class="small muted">${esc(iv.status)} · ${esc(when(iv.created_at))}${usage}</div>
+      ${estimate}
+    </div>`;
+}
+
+/** The estimate for recent interviews. Read-only, and it names no candidate. An unpriced line is
+ *  said to be unpriced, never filled in. */
+async function viewCosts() {
+  const r = await api("/admin/costs?limit=50");
+  const t = r.totals;
+  const prices = r.prices
+    ? `LLM prices: ${esc(r.prices.source)} copy of llm-prices.com, dated ${esc(r.prices.updated_at)}, retrieved ${esc(when(r.prices.fetched_at))}.`
+    : "LLM prices are unavailable: the price feed is unreachable and no copy is cached. LLM costs are not shown.";
+  const missing = r.missing_rates.length
+    ? `<div class="card note"><strong>Not included in the estimate:</strong> ${r.missing_rates
+        .map((m) => `<code>${esc(m)}</code>`)
+        .join(", ")}. These are set through environment variables, so they are missing from the total.</div>`
+    : "";
+
+  app.innerHTML = `
+    <div class="spread">
+      <div>
+        <h2>Costs</h2>
+        <p class="sub">An estimate from usage the software counted, priced at current list rates. It is not an invoice.
+          Reconcile it against the provider bills before relying on it.</p>
+      </div>
+      <div class="row"><a class="btn" href="#/profiles">Back to profiles</a></div>
+    </div>
+
+    <p class="small muted">${prices}</p>
+    ${missing}
+
+    <div class="card">
+      <div class="row" style="gap: 32px">
+        <div><div class="small muted">Estimated total</div><div style="font-size: 24px; font-weight: 600">${money(t.estimate_usd)}</div></div>
+        <div><div class="small muted">Priced in full</div><div>${t.complete}</div></div>
+        <div><div class="small muted">Partly priced</div><div>${t.partial}</div></div>
+        <div><div class="small muted">No usage recorded</div><div>${t.no_usage}</div></div>
+      </div>
+      <p class="small muted">Totals include only the lines that have a price. Partly priced interviews are counted at what could be priced.</p>
+    </div>
+
+    <h3>Recent interviews</h3>
+    ${r.interviews.length === 0 ? `<div class="card muted">No interviews yet.</div>` : ""}
+    ${r.interviews.map(costRow).join("")}`;
+}
+
+// ------------------------------------------------------------------ start
+
+async function start() {
+  try {
+    const response = await fetch("/config", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`Could not load the configuration (${response.status}).`);
+    config = await response.json();
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>The panel could not start</h2><p class="sub">${esc(e.message)}</p></div>`;
+    return;
+  }
+  DURATION_MIN = config.duration_min;
+  DURATION_MAX = config.duration_max;
+  RETENTION_DAYS = config.retention_days;
+  document.title = `${config.bot_name} Admin Panel`;
+  document.getElementById("brand").textContent = config.bot_name;
+  document.getElementById("credit").textContent = config.company_credit;
+  document.getElementById("company").textContent = config.company_name;
+
+  window.addEventListener("hashchange", render);
+  render();
+}
+
+void start();

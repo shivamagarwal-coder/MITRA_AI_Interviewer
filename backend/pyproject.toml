@@ -1,0 +1,55 @@
+[project]
+name = "interviewer-backend"
+version = "0.1.0"
+description = "AI voice interviewer — backend, blueprint pipeline, and Pipecat bot"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Note the absence of the `local-smart-turn` extra. It exists for the v2
+    # CoreML/PyTorch turn analysers and drags in torch, torchaudio, transformers
+    # and coremltools — around 570MB, none of it loaded at runtime. We use
+    # LocalSmartTurnAnalyzerV3, whose model is a bundled ONNX file run through
+    # onnxruntime, which pipecat already depends on. Verified by importing the
+    # analyser and checking that torch never enters sys.modules.
+    "pipecat-ai[daily,openai,elevenlabs,silero,deepgram]==1.6.0",
+    "python-dotenv>=1.0",
+    "aiohttp>=3.9",
+    "loguru>=0.7",
+    # Milestone 2: employer panel API, blueprint pipeline, persistence.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.9",
+    "sqlalchemy[asyncio]>=2.0",
+    # Schema migrations. Every change to a table goes through a revision in
+    # alembic/versions/, so production and a fresh database end up identical.
+    "alembic>=1.13",
+    # S3 storage for interview recordings (app/recording_s3.py).
+    "boto3>=1.35",
+    "asyncpg>=0.30",
+    "aiosqlite>=0.20",
+    "pypdf>=5.0",
+    "python-docx>=1.1",
+    # The container image carries no system timezone database, so ZoneInfo
+    # cannot resolve names the candidate's browser sends. A live session sent
+    # "Asia/Calcutta", a perfectly valid alias, and it only produced the right
+    # greeting because the fallback happened to be the same place.
+    "tzdata>=2024.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+# The default run is the deterministic suite only. The behaviour suite makes
+# real LLM calls and is opted into explicitly (RUN_BEHAVIOR_TESTS=1), so the
+# fast suite stays trustworthy and CI-gating.
+addopts = "-m 'not behavior'"
+markers = [
+    "behavior: real-LLM behaviour checks; slow, costs money, tolerant assertions",
+]

@@ -1,0 +1,1886 @@
+"""Interview lifecycle and join authentication.
+
+No Daily, no bot, no LLM — those are stubbed. What is under test is the glue
+that lets an interview exist at all, and the access control on joining one.
+
+The join endpoint is the only unauthenticated door into this system. A candidate
+types a meeting ID and a password and gets a token into a live room. It gets the
+most attention here.
+"""
+
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.meeting import (
+    new_meeting_id,
+    new_password,
+    normalise_meeting_id,
+    passwords_match,
+)
+from shared.contracts import Competency, CompetencyPlan, EvaluationSpec, InterviewBlueprint
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "documents")
+
+
+def blueprint_for(candidate_id: str) -> InterviewBlueprint:
+    return InterviewBlueprint(
+        blueprint_id=candidate_id,
+        evaluation_spec=EvaluationSpec(
+            role_title="Lead Product Manager — AI & Data Products",
+            seniority="Senior",
+            experience_expectation="10+ years",
+            duration_minutes=40,
+            competencies=[Competency(id="a", name="A", description="d", weight=1.0)],
+        ),
+        candidate_name="Prateek Verma",
+        candidate_summary="Twelve years in AI product.",
+        competency_plans=[
+            CompetencyPlan(
+                competency_id="a",
+                name="A",
+                target_depth="deep",
+                seed_questions=["q"],
+                time_budget_minutes=30.0,
+            )
+        ],
+        suggested_opening="Hello.",
+    )
+
+
+class FakeRoom:
+    def __init__(self):
+        self.name = "abc123"
+        self.url = "https://example.daily.co/abc123"
+        self.expires_at = 0
+
+
+@pytest.fixture
+async def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/int.db")
+    for key in ("OPENAI_API_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "DAILY_API_KEY"):
+        monkeypatch.setenv(key, "test")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password-0123456789")
+
+    from app import db, interviews, main
+    from app.auth import LoginThrottle
+
+    # Fresh candidate counters per test. The real ones are module-level, so one test's
+    # wrong guesses would otherwise lock the meeting for the next.
+    monkeypatch.setattr(interviews, "CANDIDATE_MEETING_THROTTLE", LoginThrottle(max_failures=5))
+    monkeypatch.setattr(interviews, "CANDIDATE_CLIENT_THROTTLE", LoginThrottle(max_failures=30))
+    from app.capacity import registry
+
+    await db.reset_engine()
+    # The registry is module-level and shared by every test. A seat left behind by one
+    # test would make a later join look like the container is full.
+    registry.clear()
+
+    spawned: list[dict] = []
+
+    async def fake_create_room(**kwargs):
+        return FakeRoom()
+
+    async def fake_create_token(**kwargs):
+        return f"token-for-{kwargs.get('room_name')}-owner={kwargs.get('is_owner')}"
+
+    class FakeBot:
+        """Stands in for a live process, so the seat is held as it would be in
+        production: a live bot counts until it exits."""
+
+        returncode = None
+
+    async def fake_start_bot(**kwargs):
+        spawned.append(kwargs)
+        registry.register(kwargs["interview_id"], FakeBot())
+        async with db.get_sessionmaker()() as session:
+            interview = await session.get(db.Interview, kwargs["interview_id"])
+            interview.status = db.InterviewStatus.IN_PROGRESS
+            interview.started_at = datetime.now(UTC)
+            await session.commit()
+
+    monkeypatch.setattr(interviews, "create_room", fake_create_room)
+    monkeypatch.setattr(interviews, "create_meeting_token", fake_create_token)
+    monkeypatch.setattr(interviews, "_start_bot", fake_start_bot)
+
+    with TestClient(main.app) as test_client:
+        test_client.spawned = spawned
+        test_client.post("/admin/login", json={"password": "test-admin-password-0123456789"})
+        yield test_client
+
+    registry.clear()
+
+    await db.reset_engine()
+
+
+async def make_candidate(*, ready: bool = True) -> str:
+    """Insert a job and candidate directly — the upload path is tested elsewhere."""
+    from app import db
+
+    candidate_id = "cand_test1"
+    async with db.get_sessionmaker()() as session:
+        session.add(db.Job(id="job_1", jd_text="jd", spec_status=db.SpecStatus.READY))
+        await session.commit()
+    async with db.get_sessionmaker()() as session:
+        session.add(
+            db.Candidate(
+                id=candidate_id,
+                job_id="job_1",
+                name="Prateek Verma",
+                cv_text="cv",
+                blueprint=blueprint_for(candidate_id).model_dump(mode="json") if ready else None,
+                blueprint_status=(
+                    db.BlueprintStatus.READY if ready else db.BlueprintStatus.GENERATING
+                ),
+            )
+        )
+        await session.commit()
+    return candidate_id
+
+
+# -- credentials -------------------------------------------------------------
+
+
+def test_meeting_ids_are_readable_aloud():
+    for _ in range(20):
+        value = new_meeting_id()
+        assert len(value) == 11 and value.count("-") == 2
+        assert value.replace("-", "").isdigit()
+
+
+def test_password_alphabet_contains_no_confusable_pair():
+    """These get read out loud and typed by hand.
+
+    Asserts the property rather than a hand-written list of bad characters —
+    the first version of this test listed "0O1lI5S" while the alphabet still
+    contained both `5` and `s`.
+    """
+    from app.meeting import CONFUSABLE_PAIRS, PASSWORD_ALPHABET
+
+    for first, second in CONFUSABLE_PAIRS:
+        assert not (first in PASSWORD_ALPHABET and second in PASSWORD_ALPHABET), (
+            f"'{first}' and '{second}' are confusable but both are in the alphabet"
+        )
+
+
+def test_passwords_use_only_the_safe_alphabet():
+    from app.meeting import PASSWORD_ALPHABET
+
+    for _ in range(50):
+        assert set(new_password()) <= set(PASSWORD_ALPHABET)
+
+
+@pytest.mark.parametrize(
+    "typed",
+    ["428-193-756", "428193756", "428 193 756", " 428-193-756 ", "428.193.756"],
+)
+def test_meeting_ids_survive_how_people_actually_type_them(typed):
+    """Refusing a correct ID over a stray space is a pointless way to start
+    someone's interview."""
+    assert normalise_meeting_id(typed) == "428-193-756"
+
+
+@pytest.mark.parametrize("typed", ["", "42819375", "4281937560", "abc-def-ghi"])
+def test_malformed_meeting_ids_are_rejected(typed):
+    assert normalise_meeting_id(typed) == ""
+
+
+def test_password_comparison_is_case_insensitive():
+    assert passwords_match("Ab3Kd9Xy", "ab3kd9xy")
+    assert not passwords_match("ab3kd9xy", "ab3kd9xz")
+
+
+# -- creating an interview ---------------------------------------------------
+
+
+async def test_interview_is_created_with_credentials(client):
+    candidate_id = await make_candidate()
+
+    response = client.post(f"/candidates/{candidate_id}/interviews")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "scheduled"
+    assert normalise_meeting_id(body["meeting_id"]) == body["meeting_id"]
+    assert len(body["password"]) >= 8
+
+
+async def test_interview_cannot_be_created_without_a_ready_blueprint(client):
+    """An interview with no plan to run is not an interview."""
+    candidate_id = await make_candidate(ready=False)
+
+    response = client.post(f"/candidates/{candidate_id}/interviews")
+
+    assert response.status_code == 409
+    assert "not ready" in response.json()["detail"]
+
+
+async def test_scheduling_does_not_start_a_bot(client):
+    """Booking a week early must not park a bot in an empty room."""
+    candidate_id = await make_candidate()
+    client.post(f"/candidates/{candidate_id}/interviews")
+
+    assert client.spawned == []
+
+
+# -- joining -----------------------------------------------------------------
+
+
+async def test_correct_credentials_return_a_token_and_start_the_bot(client):
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    response = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": created["password"], "consent": True},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["token"]
+    assert body["room_url"].startswith("https://")
+    assert body["candidate_name"] == "Prateek Verma"
+    assert len(client.spawned) == 1
+
+
+async def test_wrong_password_is_refused(client):
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    response = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": "wrongpass", "consent": True},
+    )
+
+    assert response.status_code == 401
+    assert client.spawned == []
+
+
+async def test_unknown_and_wrong_password_are_indistinguishable(client):
+    """Different messages would let someone probe for valid meeting IDs."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    wrong_password = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": "wrongpass", "consent": True},
+    )
+    no_such_meeting = client.post(
+        "/interviews/join", json={"meeting_id": "111-222-333", "password": "wrongpass", "consent": True}
+    )
+
+    assert wrong_password.status_code == no_such_meeting.status_code == 401
+    assert wrong_password.json()["detail"] == no_such_meeting.json()["detail"]
+
+
+async def test_rejoining_does_not_start_a_second_bot(client):
+    """A candidate refreshing the page must not put two interviewers in the room."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    payload = {
+        "meeting_id": created["meeting_id"],
+        "password": created["password"],
+        "consent": True,
+    }
+
+    client.post("/interviews/join", json=payload)
+    second = client.post("/interviews/join", json=payload)
+
+    assert second.status_code == 200
+    assert len(client.spawned) == 1
+
+
+async def test_a_join_is_refused_when_the_container_is_full(client, monkeypatch):
+    """Refusing one candidate beats OOM-killing everyone else's interview."""
+    from app.capacity import registry
+
+    monkeypatch.setenv("MAX_CONCURRENT_INTERVIEWS", "1")
+
+    class Running:
+        returncode = None
+
+    registry.register("int_someone_else", Running())
+    try:
+        candidate_id = await make_candidate()
+        created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+        response = client.post(
+            "/interviews/join",
+            json={
+                "meeting_id": created["meeting_id"],
+                "password": created["password"],
+                "consent": True,
+            },
+        )
+
+        assert response.status_code == 503
+        assert "still valid" in response.json()["detail"]
+        assert client.spawned == []
+    finally:
+        registry.release("int_someone_else")
+
+
+async def test_a_refused_join_does_not_record_consent(client, monkeypatch):
+    """Consent means "this interview is being recorded". If no interview
+    happened, storing an acceptance would put a false record against a person."""
+    from app import db
+    from app.capacity import registry
+
+    monkeypatch.setenv("MAX_CONCURRENT_INTERVIEWS", "1")
+
+    class Running:
+        returncode = None
+
+    registry.register("int_someone_else", Running())
+    try:
+        candidate_id = await make_candidate()
+        created = client.post(f"/candidates/{candidate_id}/interviews").json()
+        client.post(
+            "/interviews/join",
+            json={
+                "meeting_id": created["meeting_id"],
+                "password": created["password"],
+                "consent": True,
+            },
+        )
+
+        async with db.get_sessionmaker()() as session:
+            interview = await session.get(db.Interview, created["interview_id"])
+            assert interview.consent_accepted_at is None
+            assert interview.status == db.InterviewStatus.SCHEDULED
+    finally:
+        registry.release("int_someone_else")
+
+
+async def test_capacity_does_not_block_a_candidate_rejoining(client, monkeypatch):
+    """Their bot is already running, so reconnecting costs no new memory.
+    Refusing them would strand someone mid-interview on a dropped connection."""
+    from app.capacity import registry
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    payload = {
+        "meeting_id": created["meeting_id"],
+        "password": created["password"],
+        "consent": True,
+    }
+    assert client.post("/interviews/join", json=payload).status_code == 200
+
+    monkeypatch.setenv("MAX_CONCURRENT_INTERVIEWS", "1")
+
+    class Running:
+        returncode = None
+
+    registry.register("int_someone_else", Running())
+    try:
+        assert client.post("/interviews/join", json=payload).status_code == 200
+    finally:
+        registry.release("int_someone_else")
+
+
+async def test_expired_room_is_refused(client):
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.room_expires_at = datetime.now(UTC) - timedelta(hours=1)
+        await session.commit()
+
+    response = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": created["password"], "consent": True},
+    )
+
+    assert response.status_code == 410
+    assert "expired" in response.json()["detail"]
+
+
+async def test_completed_interview_cannot_be_rejoined(client):
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        await session.commit()
+
+    response = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": created["password"], "consent": True},
+    )
+
+    assert response.status_code == 410
+
+
+async def test_join_response_tells_the_candidate_nothing_about_scoring(client):
+    """The candidate's page has no business knowing what it is being scored on."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    body = client.post(
+        "/interviews/join",
+        json={"meeting_id": created["meeting_id"], "password": created["password"], "consent": True},
+    ).json()
+
+    serialised = str(body).lower()
+    for leak in ("competenc", "weight", "red_flag", "target_depth", "seed_question"):
+        assert leak not in serialised
+
+
+# -- persistence -------------------------------------------------------------
+
+
+async def test_transcript_is_written_back_to_the_interview(client):
+    """The bot writes this on exit; here we check the record round-trips."""
+    from app import db
+    from bot.persistence import build_transcript, save_interview_result
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    interview_id = created["interview_id"]
+
+    transcript = build_transcript(
+        interview_id=interview_id,
+        turns=[
+            {"speaker": "pre_interview_audio", "text": "Enjoyment", "at_seconds": 1.0},
+            {"speaker": "interviewer", "text": "Good evening.", "at_seconds": 2.0},
+            {"speaker": "candidate", "text": "Hello there.", "at_seconds": 4.0},
+        ],
+        duration_seconds=310.0,
+    )
+    await save_interview_result(
+        interview_id=interview_id,
+        transcript=transcript,
+        section_outcomes=[{"section_id": "a"}],
+        session_metrics={"latency_summary": {"ttfa_median_ms": 2100.0}},
+    )
+
+    view = client.get(f"/interviews/{interview_id}").json()
+    assert view["status"] == "completed"
+    assert view["ended_at"]
+    speakers = [t["speaker"] for t in view["transcript"]["turns"]]
+    # Room noise never becomes part of the candidate's record.
+    assert speakers == ["interviewer", "candidate"]
+    assert view["section_outcomes"] == [{"section_id": "a"}]
+    # Telemetry must survive too: on Railway the session files are ephemeral,
+    # so the database is the only place latency data can live.
+    assert view["session_metrics"]["latency_summary"]["ttfa_median_ms"] == 2100.0
+
+
+async def test_saving_against_a_missing_interview_does_not_raise(client):
+    """A database problem must not lose the session on top of whatever already
+    went wrong."""
+    from bot.persistence import build_transcript, save_interview_result
+
+    await save_interview_result(
+        interview_id="int_nope",
+        transcript=build_transcript(interview_id="int_nope", turns=[], duration_seconds=0.0),
+        section_outcomes=[],
+    )
+
+
+async def test_interviews_are_listed_for_a_candidate(client):
+    """History accumulates once sessions actually finish."""
+    from app import db
+
+    candidate_id = await make_candidate()
+    first = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, first["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        await session.commit()
+
+    client.post(f"/candidates/{candidate_id}/interviews")
+
+    rows = client.get(f"/candidates/{candidate_id}/interviews").json()
+
+    assert len(rows) == 2
+    assert {r["status"] for r in rows} == {"completed", "scheduled"}
+
+
+# -- one session at a time ---------------------------------------------------
+
+
+async def test_a_second_session_is_refused_while_one_is_open(client):
+    """Two sessions meant two Daily rooms and two credential pairs — and
+    whichever set the candidate got, the other room sat paid for and empty."""
+    candidate_id = await make_candidate()
+    first = client.post(f"/candidates/{candidate_id}/interviews")
+    assert first.status_code == 200
+
+    second = client.post(f"/candidates/{candidate_id}/interviews")
+
+    assert second.status_code == 409
+    assert first.json()["meeting_id"] in second.json()["detail"]
+
+
+async def test_a_new_session_is_allowed_once_the_last_one_completed(client):
+    from app import db
+
+    candidate_id = await make_candidate()
+    first = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, first["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        await session.commit()
+
+    second = client.post(f"/candidates/{candidate_id}/interviews")
+
+    assert second.status_code == 200
+    assert second.json()["meeting_id"] != first["meeting_id"]
+
+
+async def test_cancelling_a_scheduled_session_frees_the_candidate(client):
+    candidate_id = await make_candidate()
+    first = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    cancelled = client.delete(f"/interviews/{first['interview_id']}")
+    assert cancelled.status_code == 200
+
+    assert client.post(f"/candidates/{candidate_id}/interviews").status_code == 200
+
+
+async def test_a_live_interview_cannot_be_cancelled(client):
+    """Someone is mid-sentence in that room; a stray click must not cut them off."""
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.IN_PROGRESS
+        await session.commit()
+
+    response = client.delete(f"/interviews/{created['interview_id']}")
+
+    assert response.status_code == 409
+    assert "cannot be cancelled" in response.json()["detail"]
+
+
+async def test_a_completed_interview_cannot_be_cancelled(client):
+    """It is a record of something that happened. Records are not cancelled."""
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        await session.commit()
+
+    assert client.delete(f"/interviews/{created['interview_id']}").status_code == 409
+
+
+async def test_unknown_interview_returns_404(client):
+    assert client.get("/interviews/int_nope").status_code == 404
+
+
+# -- consent -----------------------------------------------------------------
+
+
+async def test_no_bot_starts_without_consent(client):
+    """There must be no path where someone is recorded before agreeing to be."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    response = client.post(
+        "/interviews/join",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "consent": False,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "recording notice" in response.json()["detail"]
+    assert client.spawned == []
+
+
+async def test_consent_is_timestamped_against_the_interview(client):
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    client.post(
+        "/interviews/join",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "consent": True,
+        },
+    )
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        assert interview.consent_accepted_at is not None
+
+
+async def test_frontend_lives_outside_the_python_package(client):
+    """Both UIs are their own thing at the repo root, not files inside the
+    backend package — and the Docker image mirrors that layout, so a path that
+    works locally works in production too."""
+    from app.main import FRONTEND_DIR
+
+    assert FRONTEND_DIR.name == "frontend"
+    assert (FRONTEND_DIR / "admin" / "index.html").exists()
+    assert (FRONTEND_DIR / "candidate" / "index.html").exists()
+    assert (FRONTEND_DIR / "static" / "admin" / "admin.js").exists()
+    assert (FRONTEND_DIR / "static" / "candidate" / "main.js").exists()
+
+
+async def test_the_join_page_is_served(client):
+    """Candidates stay on our domain and never see a Daily URL."""
+    response = client.get("/join")
+
+    assert response.status_code == 200
+    assert '<div id="app">' in response.text
+    from tests.frontend_source import join_source
+
+    body = join_source()
+    assert "AI interviewer" in body
+    # The exact consent wording is not pinned here. It used to be, on two
+    # phrases that turned out to be untrue: the page promised a recording that
+    # was never made, and said the interview was voice only after the camera was
+    # switched on. What is asserted is that the candidate is told what happens
+    # to what they say, which stays true however the copy is worded.
+    assert "transcript" in body.lower()
+    assert "daily.co" not in body.lower()
+    # The checkbox starts unticked: its state starts false, and nothing is pre-checked.
+    assert "consent: false" in body
+    assert "defaultChecked" not in body and "checked: true" not in body and "checked = true" not in body
+
+
+async def test_the_bot_is_named_consistently_everywhere(client):
+    """The name reaches the candidate three ways — the spoken introduction, the
+    participant list, and this page. A bot that calls itself one thing and
+    appears as another is unsettling when someone is already nervous."""
+    from bot.brain.prompting import render_section_prompt
+    from bot.blueprint_source import load_blueprint
+    from bot.brain.state import build_sections
+    from bot.run_bot import BOT_NAME as call_name
+    from shared.branding import BOT_NAME
+
+    # The join page reads the name from /config, so the served value is the one that matters.
+    assert client.get("/config").json()["bot_name"] == BOT_NAME
+
+    assert call_name == BOT_NAME
+
+    blueprint = load_blueprint()
+    opening = render_section_prompt(
+        blueprint=blueprint,
+        section=build_sections(blueprint)[0],
+        carried_claims=[],
+        unprobed_contradictions=[],
+        remaining_seconds=120,
+        is_last_competency=False,
+        time_of_day="evening",
+    )
+    assert BOT_NAME in opening
+
+
+async def test_the_call_ui_is_ours_not_daily_prebuilt(client):
+    """Prebuilt gives a meeting app — participant grid, screen share, Daily
+    branding. A candidate should see an interview, not a conferencing tool."""
+    from tests.frontend_source import join_source
+
+    body = join_source()
+
+    assert "createCallObject" in body
+    assert "createFrame" not in body
+    # No embedded frame. (The SDK's global is named `DailyIframe` even for call
+    # objects, so checking for the substring "iframe" would be meaningless.)
+    assert "<iframe" not in body.lower()
+    # We own media playback with a call object; without this the bot is silent.
+    assert "track-started" in body
+
+
+# -- deployment safety -------------------------------------------------------
+
+
+def test_production_refuses_to_start_without_a_database(monkeypatch):
+    """Forget the variable and a SQLite fallback would engage silently: green health
+    checks, working interviews, and every transcript lost on the next deploy. Loud
+    failure is the only safe behaviour."""
+    from app.db import DatabaseNotConfigured, database_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("APP_ENV", "production")
+
+    with pytest.raises(DatabaseNotConfigured, match="DATABASE_URL is not set"):
+        database_url()
+
+
+def test_an_unset_environment_fails_closed(monkeypatch):
+    """The regression this guard was rewritten for. Before, an unknown host was treated
+    as a laptop. Now an unset APP_ENV with no database refuses, and only an explicit
+    development setup may use the SQLite file."""
+    from app.db import DatabaseNotConfigured, database_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("APP_ENV", raising=False)
+
+    with pytest.raises(DatabaseNotConfigured):
+        database_url()
+
+
+def test_local_development_may_use_sqlite_when_it_says_so(monkeypatch):
+    from app.db import database_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("APP_ENV", "development")
+
+    assert database_url().startswith("sqlite+aiosqlite")
+
+
+def test_production_refuses_a_sqlite_url_even_when_one_is_given(monkeypatch):
+    from app.db import DatabaseNotConfigured, database_url
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./interviewer.db")
+
+    with pytest.raises(DatabaseNotConfigured, match="refuses a SQLite"):
+        database_url()
+
+
+def test_only_the_exact_production_setting_counts_as_deployed(monkeypatch):
+    from app.db import is_deployed
+
+    monkeypatch.setenv("APP_ENV", "production")
+    assert is_deployed()
+    monkeypatch.setenv("APP_ENV", "Production ")
+    assert is_deployed()
+    monkeypatch.setenv("APP_ENV", "staging")
+    assert not is_deployed()
+    monkeypatch.delenv("APP_ENV", raising=False)
+    assert not is_deployed()
+
+
+def test_postgres_scheme_is_rewritten_for_asyncpg(monkeypatch):
+    """Hosted Postgres hands out `postgresql://`; the async engine needs the driver named."""
+    from app.db import database_url
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@host:5432/mitra")
+    assert database_url() == "postgresql+asyncpg://user:pw@host:5432/mitra"
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pw@host:5432/mitra")
+    assert database_url() == "postgresql+asyncpg://user:pw@host:5432/mitra"
+
+
+# -- employer panel ----------------------------------------------------------
+
+
+async def test_admin_panel_is_served_as_a_plain_page(client):
+    """The panel is a plain HTML page. Its names come from /config, which the page's script reads."""
+    from shared.branding import BOT_NAME
+
+    response = client.get("/admin")
+
+    assert response.status_code == 200
+    assert 'id="app"' in response.text
+    assert client.get("/config").json()["bot_name"] == BOT_NAME
+
+
+async def test_page_assets_are_served_with_the_right_types(client):
+    """Every script and stylesheet the two pages load is served, from /static, with the right type."""
+    import re
+
+    for page_path in ("/admin", "/join"):
+        page = client.get(page_path).text
+        scripts = re.findall(r'src="(/static/[^"]+\.js)"', page)
+        styles = re.findall(r'href="(/static/[^"]+\.css)"', page)
+        assert scripts, f"{page_path} loads no script"
+        assert styles, f"{page_path} loads no stylesheet"
+        for path in scripts:
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert "javascript" in response.headers["content-type"]
+        for path in styles:
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert "css" in response.headers["content-type"]
+
+
+async def test_jobs_and_candidates_can_be_listed(client):
+    """The panel needs these; nothing else did, so they did not exist."""
+    candidate_id = await make_candidate()
+
+    jobs = client.get("/jobs").json()
+    assert len(jobs) == 1
+    assert jobs[0]["job_id"] == "job_1"
+
+    candidates = client.get("/jobs/job_1/candidates").json()
+    assert [c["candidate_id"] for c in candidates] == [candidate_id]
+    assert candidates[0]["blueprint_status"] == "ready"
+
+
+async def test_candidate_listing_surfaces_generation_failures(client):
+    """A blueprint that failed must be visible in the list, not silently absent."""
+    from app import db
+
+    await make_candidate()
+    async with db.get_sessionmaker()() as session:
+        session.add(
+            db.Candidate(
+                id="cand_broken",
+                job_id="job_1",
+                cv_text="cv",
+                blueprint_status=db.BlueprintStatus.FAILED,
+                blueprint_error="model unavailable",
+            )
+        )
+        await session.commit()
+
+    rows = client.get("/jobs/job_1/candidates").json()
+    broken = next(r for r in rows if r["candidate_id"] == "cand_broken")
+    assert broken["blueprint_status"] == "failed"
+    assert broken["blueprint_error"] == "model unavailable"
+
+
+# -- admin authentication ----------------------------------------------------
+
+
+async def test_admin_routes_are_closed_without_a_session(client):
+    """The panel exposes every JD, CV and transcript in the database. On a
+    public URL that cannot be open to anyone who guesses the path."""
+    client.cookies.clear()
+
+    for path in ("/jobs", "/jobs/job_1", "/candidates/cand_x"):
+        assert client.get(path).status_code == 401, path
+
+
+async def test_candidate_join_stays_public(client):
+    """Candidates have no account. Their credential is the meeting password."""
+    client.cookies.clear()
+
+    response = client.post(
+        "/interviews/join",
+        json={"meeting_id": "111-222-333", "password": "nope", "consent": True},
+    )
+    # 401 for wrong credentials, not for being signed out of the admin panel.
+    assert "meeting ID and password" in response.json()["detail"]
+
+
+async def test_wrong_admin_password_is_refused(client):
+    client.cookies.clear()
+    assert client.post("/admin/login", json={"password": "wrong"}).status_code == 401
+    assert client.get("/jobs").status_code == 401
+
+
+async def test_signing_out_ends_the_session(client):
+    assert client.get("/jobs").status_code == 200
+    client.post("/admin/logout")
+    assert client.get("/jobs").status_code == 401
+
+
+async def test_a_copied_cookie_stops_working_after_sign_out(client):
+    """Clearing the cookie alone left a copied one valid for twelve hours. The sign-out
+    must end the token itself, so replaying the old value is refused."""
+    token = client.cookies.get("mitra_admin")
+    assert token, "the fixture signs in, so there is a cookie to copy"
+
+    client.post("/admin/logout")
+    client.cookies.set("mitra_admin", token)
+
+    assert client.get("/jobs").status_code == 401
+    assert client.get("/admin/session").json() == {"signed_in": False}
+
+
+async def test_signing_in_again_after_a_sign_out_works(client):
+    client.post("/admin/logout")
+    assert client.post("/admin/login", json={"password": "test-admin-password-0123456789"}).status_code == 200
+    assert client.get("/jobs").status_code == 200
+
+
+async def test_login_cookie_is_not_secure_over_plain_http(tmp_path, monkeypatch):
+    """Hardcoding secure=True meant the browser never sent the cookie back over
+    HTTP, so login succeeded and every following request 401'd — on localhost."""
+    # Its own database. Without this it would open the developer's local file, whose
+    # schema the startup check is right to refuse until it is adopted.
+    from app import db
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/cookie.db")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password-0123456789")
+    from app.main import app as fresh
+
+    await db.reset_engine()
+    try:
+        with TestClient(fresh) as c:
+            response = c.post("/admin/login", json={"password": "test-admin-password-0123456789"})
+            assert "Secure" not in response.headers.get("set-cookie", "")
+            assert "HttpOnly" in response.headers["set-cookie"]
+    finally:
+        await db.reset_engine()
+
+
+async def test_deleting_a_profile_removes_everything_under_it(client):
+    """Cascades to CVs, plans and transcripts. There is no undo."""
+    from app import db
+
+    candidate_id = await make_candidate()
+    booked = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    # A scheduled session is cancelled first. Deleting under a scheduled one is refused
+    # (see the test below), so a profile can only be removed once its sessions are gone.
+    assert client.delete(f"/interviews/{booked['interview_id']}").status_code == 200
+
+    assert client.delete("/jobs/job_1").status_code == 200
+    assert client.get("/jobs").json() == []
+    assert client.get(f"/candidates/{candidate_id}").status_code == 404
+
+    async with db.get_sessionmaker()() as session:
+        from sqlalchemy import select
+
+        rows = (await session.scalars(select(db.Interview))).all()
+        assert rows == []
+
+
+async def test_deleting_an_unknown_profile_is_404(client):
+    assert client.delete("/jobs/job_nope").status_code == 404
+
+
+async def test_a_profile_with_a_live_interview_is_not_deleted(client):
+    """Deleting under a running bot removes the row its transcript is written to. The
+    refusal must leave every row in place, so nothing is half-deleted."""
+    candidate_id = await make_candidate()
+    client.post(f"/candidates/{candidate_id}/interviews")
+
+    response = client.delete("/jobs/job_1")
+
+    assert response.status_code == 409
+    assert client.get("/jobs").json() != []
+    assert client.get(f"/candidates/{candidate_id}").status_code == 200
+
+
+#: Everything a signed-out visitor is allowed to reach. Anything not on this
+#: list must be behind the admin login — the database holds job descriptions,
+#: CVs and interview transcripts, all of it personal data on a public URL.
+PUBLIC_ROUTES = {
+    # Names, logo paths and the interview-length rule. Public because the sign-in screen needs
+    # them before anyone is signed in, and it holds no secret.
+    ("GET", "/config"),
+    ("POST", "/interviews/join"),  # candidate's own credential is the password
+    # Same credential, same reason: the candidate's own browser reporting about
+    # the candidate's own interview, and it holds no other secret.
+    ("POST", "/interviews/focus"),
+    ("GET", "/join"),  # the candidate join page itself
+    ("GET", "/health"),
+    ("POST", "/admin/login"),
+    ("POST", "/admin/logout"),
+    ("GET", "/admin/session"),  # answers "am I signed in?"; leaks nothing
+    ("GET", "/admin"),  # the login screen has to render before you can log in
+    ("GET", "/admin/admin.js"),
+    ("GET", "/assets/{filename}"),  # the logo, on the sign-in and join screens
+    ("GET", "/"),
+}
+
+
+def test_every_route_is_guarded_unless_it_is_deliberately_public():
+    """A sweep, not a spot check.
+
+    Guards were added route by route, which is exactly the pattern where a new
+    endpoint gets merged without one. This fails the moment that happens.
+    """
+    from fastapi.routing import APIRoute
+
+    from app.auth import require_admin
+    from app.main import app
+
+    unguarded = []
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in route.methods - {"HEAD", "OPTIONS"}:
+            if (method, route.path) in PUBLIC_ROUTES:
+                continue
+            if not any(d.call is require_admin for d in route.dependant.dependencies):
+                unguarded.append(f"{method} {route.path}")
+
+    assert not unguarded, (
+        "These routes are reachable without signing in. Either guard them with "
+        f"Depends(require_admin) or add them to PUBLIC_ROUTES: {sorted(unguarded)}"
+    )
+
+
+async def test_transcripts_are_not_readable_signed_out(client):
+    """The most sensitive read in the system: a candidate's full transcript."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews")
+    interview_id = created.json()["interview_id"]
+
+    client.cookies.clear()
+    assert client.get(f"/interviews/{interview_id}").status_code == 401
+    assert client.get(f"/candidates/{candidate_id}/interviews").status_code == 401
+
+
+async def test_starting_an_interview_requires_signing_in(client):
+    """It mints a paid Daily room. An open endpoint is a billable one."""
+    candidate_id = await make_candidate()
+    client.cookies.clear()
+
+    assert client.post(f"/candidates/{candidate_id}/interviews").status_code == 401
+
+
+# -- feedback ----------------------------------------------------------------
+
+
+async def test_feedback_can_be_retried_for_a_completed_interview(client, monkeypatch):
+    """Scoring normally happens by itself. This is the path for when the bot
+    process was killed mid-scoring, or the model call failed."""
+    from app import db, interviews
+
+    scored = []
+
+    async def fake_generate(interview_id):
+        scored.append(interview_id)
+
+    monkeypatch.setattr("feedback.run.generate_feedback", fake_generate)
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        interview.feedback_status = db.FeedbackStatus.FAILED
+        interview.feedback_error = "model unavailable"
+        await session.commit()
+
+    response = client.post(f"/interviews/{created['interview_id']}/feedback")
+
+    assert response.status_code == 200
+    assert scored == [created["interview_id"]]
+    # The previous failure is cleared so the panel does not keep showing it.
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert view["feedback_error"] is None
+
+
+async def test_an_unfinished_interview_cannot_be_scored(client):
+    """There is no complete transcript yet, and scoring a partial one would
+    judge someone on half a conversation."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    response = client.post(f"/interviews/{created['interview_id']}/feedback")
+
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+
+
+async def test_scoring_is_not_started_twice_concurrently(client):
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        interview.feedback_status = db.FeedbackStatus.GENERATING
+        await session.commit()
+
+    response = client.post(f"/interviews/{created['interview_id']}/feedback")
+
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+async def test_a_successful_report_can_be_regenerated(client, monkeypatch):
+    """Not only a retry for failures — rebuilding a good report from the same
+    transcript is a normal thing to want after the prompt improves."""
+    from app import db
+
+    scored = []
+
+    async def fake_generate(interview_id):
+        scored.append(interview_id)
+
+    monkeypatch.setattr("feedback.run.generate_feedback", fake_generate)
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        interview.feedback_status = db.FeedbackStatus.READY
+        interview.feedback_report = {"summary": "the old one"}
+        await session.commit()
+
+    response = client.post(f"/interviews/{created['interview_id']}/feedback")
+
+    assert response.status_code == 200
+    assert scored == [created["interview_id"]]
+
+
+async def test_regenerating_scores_the_stored_transcript_not_a_new_one(client, monkeypatch):
+    """The transcript is written once when the interview ends. Regenerating
+    re-reads it; it cannot reach a live or partial conversation."""
+    from app import db
+    from shared.contracts import Speaker, Transcript, TranscriptTurn
+
+    seen = {}
+
+    async def fake_generate(interview_id):
+        async with db.get_sessionmaker()() as session:
+            row = await session.get(db.Interview, interview_id)
+            seen["turns"] = len(row.transcript["turns"])
+            seen["status"] = row.status
+
+    monkeypatch.setattr("feedback.run.generate_feedback", fake_generate)
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    stored = Transcript(
+        interview_id=created["interview_id"],
+        turns=[
+            TranscriptTurn(index=0, speaker=Speaker.INTERVIEWER, text="Hello.", at_seconds=0.0),
+            TranscriptTurn(index=1, speaker=Speaker.CANDIDATE, text="Hi.", at_seconds=4.0),
+        ],
+        duration_seconds=10.0,
+    )
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        interview.transcript = stored.model_dump(mode="json")
+        interview.feedback_status = db.FeedbackStatus.READY
+        await session.commit()
+
+    client.post(f"/interviews/{created['interview_id']}/feedback")
+
+    assert seen == {"turns": 2, "status": db.InterviewStatus.COMPLETED}
+
+
+# -- brand assets -------------------------------------------------------------
+
+
+async def test_the_logo_and_favicon_are_served(client):
+    """Asserts they resolve, not what format they are. The artwork gets swapped;
+    a test that pins the file extension just breaks when it does."""
+    from shared.branding import FAVICON_URL, LOGO_URL
+
+    for url in (LOGO_URL, FAVICON_URL):
+        response = client.get(url)
+        assert response.status_code == 200, url
+        assert response.headers["content-type"].startswith("image/"), url
+        assert len(response.content) > 0, url
+
+
+async def test_assets_cannot_escape_their_folder(client):
+    """The filename comes straight off the URL, so it has to be pinned down."""
+    for attempt in ["../app/main.py", "..%2Fapp%2Fmain.py", "../../.env"]:
+        assert client.get(f"/assets/{attempt}").status_code in (404, 400)
+
+
+async def test_a_non_image_asset_is_refused(client):
+    assert client.get("/assets/main.py").status_code == 404
+
+
+async def test_the_sign_in_screen_shows_the_logo(client):
+    """The one screen with room to say what the product is."""
+    from shared.branding import LOGO_URL
+    from tests.frontend_source import panel_source
+
+    # The sign-in screen reads the logo from /config, and the panel's login screen uses it.
+    assert client.get("/config").json()["logo_url"] == LOGO_URL
+    assert "config.logo_url" in panel_source()
+
+
+async def test_the_session_list_carries_the_password(client):
+    """The candidate screen reads sessions from this list. Without the password
+    it showed a meeting ID that opens nothing, which is a credential the
+    employer cannot pass on."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    listed = client.get(f"/candidates/{candidate_id}/interviews").json()[0]
+
+    assert listed["meeting_id"] == created["meeting_id"]
+    assert listed["password"] == created["password"]
+
+
+async def test_both_screens_show_the_same_credentials(client):
+    """The candidate screen and the session screen must agree; they are the same
+    three facts and the employer reads whichever is in front of them."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    from_list = client.get(f"/candidates/{candidate_id}/interviews").json()[0]
+    from_detail = client.get(f"/interviews/{created['interview_id']}").json()
+
+    for field in ("meeting_id", "password"):
+        assert from_list[field] == from_detail[field] == created[field]
+
+
+async def test_the_panel_and_its_script_are_never_cached(client):
+    """A deploy changes these files but not their URLs. Without this the browser
+    reuses what it fetched last time and never asks again, so a shipped fix can
+    sit on the server while the panel keeps running the old code against it."""
+    # /admin is the built shell. Its scripts are hashed under /static, so a new build is a new
+    # URL and the browser cannot reuse the old one. The shell itself must not be cached.
+    for path in ("/admin", "/config"):
+        headers = client.get(path).headers
+        assert "no-cache" in headers.get("cache-control", ""), path
+
+
+async def test_artwork_is_still_cached(client):
+    """It does not change between deploys, and re-fetching it on every page
+    load is waste."""
+    from shared.branding import LOGO_URL
+
+    cache = client.get(LOGO_URL).headers.get("cache-control", "")
+    assert "max-age" in cache and "no-cache" not in cache
+
+
+# -- the candidate's clock ---------------------------------------------------
+
+
+async def test_the_browsers_timezone_reaches_the_bot(client):
+    """The greeting is only right if this survives the whole hop: browser to
+    join endpoint to spawned process."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    client.post(
+        "/interviews/join",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "consent": True,
+            "timezone": "Asia/Kolkata",
+        },
+    )
+
+    assert client.spawned[0]["timezone"] == "Asia/Kolkata"
+
+
+async def test_the_timezone_is_kept_on_the_record(client):
+    """A transcript timestamped in UTC cannot tell you what time it was for the
+    person being interviewed."""
+    from app import db
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    client.post(
+        "/interviews/join",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "consent": True,
+            "timezone": "Asia/Kolkata",
+        },
+    )
+
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        assert interview.candidate_timezone == "Asia/Kolkata"
+
+
+async def test_a_join_without_a_timezone_still_works(client):
+    """Older browsers, privacy tooling, anything. An interview must not hinge on
+    a greeting."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    response = client.post(
+        "/interviews/join",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "consent": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.spawned[0]["timezone"] is None
+
+
+# -- stored reports are re-validated on read ---------------------------------
+#
+# A report is written once as JSON and never rewritten, so a computed field
+# added to the contract afterwards is missing from every report already stored.
+# The counts it derives from are there; nothing derived it. Validating on the
+# way out fixes that without touching the row.
+#
+# The guard around it is the load-bearing part. A stored report written under an
+# older contract must not take the whole interview record down with it.
+
+
+def a_stored_report(**overrides) -> dict:
+    """A report as `feedback/run.py` writes it: `model_dump(mode="json")`."""
+    from shared.contracts import (
+        CompetencyScore,
+        ConversationHealth,
+        CoverageLevel,
+        EvidenceQuote,
+        FeedbackReport,
+        RecommendationSignal,
+        Speaker,
+    )
+
+    report = FeedbackReport(
+        interview_id="int_1",
+        blueprint_id="cand_test1",
+        role_title="Lead Product Manager",
+        competency_scores=[
+            CompetencyScore(
+                competency_id="a",
+                name="A",
+                score=4.0,
+                coverage=CoverageLevel.SUFFICIENT,
+                rationale="Shipped and measured it.",
+                evidence=[
+                    EvidenceQuote(
+                        text="we shipped it",
+                        turn_index=1,
+                        at_seconds=30.0,
+                        speaker=Speaker.CANDIDATE,
+                    )
+                ],
+            )
+        ],
+        summary="Solid.",
+        recommendation=RecommendationSignal.SOME_EVIDENCE_FOR,
+        conversation_health=ConversationHealth(
+            candidate_turns=8, repair_requests=3, disconnects=1
+        ),
+    )
+    return {**report.model_dump(mode="json"), **overrides}
+
+
+async def with_stored_report(
+    client, payload: dict | None, *, candidate_id: str | None = None
+) -> str:
+    """A completed interview carrying exactly `payload` in its report column.
+
+    `candidate_id` reuses an existing candidate. `make_candidate` inserts fixed
+    ids, so a test needing two interviews has to make the candidate once.
+    """
+    from app import db
+
+    candidate_id = candidate_id or await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.status = db.InterviewStatus.COMPLETED
+        interview.feedback_status = db.FeedbackStatus.READY
+        interview.transcript = {"interview_id": "int_1", "turns": [], "duration_seconds": 0.0}
+        interview.session_metrics = {"stt_provider": "deepgram"}
+        interview.feedback_report = payload
+        await session.commit()
+    return created["interview_id"]
+
+
+async def test_a_report_stored_without_a_computed_field_gains_it_on_read(client):
+    """The reason this change exists: `degraded` is stored, its sentence was not."""
+    stored = a_stored_report()
+    # A report dumped before `degraded` was a computed field. The counts behind
+    # it are all still there.
+    del stored["conversation_health"]["degraded"]
+    interview_id = await with_stored_report(client, stored)
+
+    health = client.get(f"/interviews/{interview_id}").json()["feedback_report"][
+        "conversation_health"
+    ]
+
+    assert health["degraded"] is True, "computed from the stored counts on read"
+    assert health["repair_requests"] == 3  # and the stored counts are untouched
+
+
+async def test_a_current_report_round_trips_unchanged(client):
+    stored = a_stored_report()
+    interview_id = await with_stored_report(client, stored)
+
+    returned = client.get(f"/interviews/{interview_id}").json()["feedback_report"]
+
+    assert returned == stored
+
+
+async def test_an_interview_with_no_report_still_returns_normally(client):
+    interview_id = await with_stored_report(client, None)
+
+    view = client.get(f"/interviews/{interview_id}")
+
+    assert view.status_code == 200
+    assert view.json()["feedback_report"] is None
+
+
+async def test_an_unreadable_report_is_dropped_and_the_interview_survives(client):
+    """The load-bearing guard.
+
+    The deployed database may hold reports written under an older contract, and
+    there is no way to check from here. A report that cannot be validated must
+    cost the reader the report, never the whole record: the transcript, the
+    metrics and the status are precisely what somebody is looking at when they
+    open an interview that went wrong.
+    """
+    interview_id = await with_stored_report(
+        client, {"interview_id": "int_1", "this": "was written under an older contract"}
+    )
+
+    response = client.get(f"/interviews/{interview_id}")
+
+    assert response.status_code == 200, "an unreadable report took down the endpoint"
+    view = response.json()
+    assert view["feedback_report"] is None
+
+    # Everything else about the interview is still there. If a later change
+    # removes the guard, this is what will fail rather than a bare non-raise.
+    assert view["interview_id"] == interview_id
+    assert view["status"] == "completed"
+    assert view["feedback_status"] == "ready"
+    assert view["transcript"] == {
+        "interview_id": "int_1",
+        "turns": [],
+        "duration_seconds": 0.0,
+    }
+    assert view["session_metrics"] == {"stt_provider": "deepgram"}
+    assert view["meeting_id"] and view["password"]
+
+
+async def test_an_unreadable_report_is_logged_with_the_interview_id(client):
+    """Silently dropping it would be the same class of bug as the one this
+    whole line of work started from."""
+    from contextlib import contextmanager
+
+    from loguru import logger
+
+    @contextmanager
+    def captured_warnings():
+        lines: list[str] = []
+        sink = logger.add(lines.append, level="WARNING")
+        try:
+            yield lines
+        finally:
+            logger.remove(sink)
+
+    interview_id = await with_stored_report(client, {"nonsense": True})
+
+    with captured_warnings() as warnings:
+        client.get(f"/interviews/{interview_id}")
+
+    assert any(interview_id in line for line in warnings)
+    assert any("does not match the current contract" in line for line in warnings)
+
+
+async def test_a_dropped_report_is_distinguishable_from_one_never_scored(client):
+    """Two different states that both arrive as `feedback_report: null`.
+
+    One is work in progress. The other is a report that exists and could not be
+    read, which nobody will retry if it is shown as the first. The pair that
+    tells them apart is already on the response: `feedback_status` is only
+    `ready` once a report has actually been stored, so `ready` with no report
+    means it was dropped on the way out.
+    """
+    from app import db
+
+    candidate_id = await make_candidate()
+    dropped = await with_stored_report(
+        client, {"written": "under an older contract"}, candidate_id=candidate_id
+    )
+    never = await with_stored_report(client, None, candidate_id=candidate_id)
+    async with db.get_sessionmaker()() as session:
+        row = await session.get(db.Interview, never)
+        row.feedback_status = db.FeedbackStatus.PENDING
+        await session.commit()
+
+    dropped_view = client.get(f"/interviews/{dropped}").json()
+    never_view = client.get(f"/interviews/{never}").json()
+
+    assert dropped_view["feedback_report"] is None
+    assert never_view["feedback_report"] is None
+    # The distinguishing signal, and it needs nothing new on the API.
+    assert dropped_view["feedback_status"] == "ready"
+    assert never_view["feedback_status"] == "pending"
+    assert dropped_view["feedback_status"] != never_view["feedback_status"]
+
+
+def test_the_panel_tells_a_dropped_report_apart_from_an_unscored_one():
+    """Inspected rather than executed, as test_copy_style.py already does.
+
+    Showing "scoring the transcript" for a report that cannot be read is a
+    system failure wearing the look of a normal state.
+    """
+    from tests.frontend_source import panel_source
+
+    panel = panel_source()
+
+    assert "iv.feedback_status === \"ready\"" in panel
+    assert "could not be opened" in panel
+
+
+async def test_the_template_list_needs_signing_in(client):
+    """Guarded like the rest of the panel. The sweep above would catch an
+    unguarded route; this says what the answer is when signed out."""
+    client.cookies.clear()
+    assert client.get("/jd-templates").status_code == 401
+
+
+async def test_the_template_list_carries_the_text(client):
+    """The panel loads all six at once rather than one request per role, so the
+    text has to be in this response."""
+    body = client.get("/jd-templates").json()
+
+    assert len(body) >= 6
+    first = body[0]
+    assert set(first) == {"slug", "title", "text"}
+    assert first["slug"] == "business-analyst"
+    assert "About the role" in first["text"]
+
+
+async def test_the_company_is_credited_at_both_ends_of_every_page(client):
+    """Who built it, on the panel and on every candidate screen.
+
+    Both pages already assert that no placeholder survives substitution, so this
+    checks the thing that test cannot: that the credit is actually in the markup
+    rather than a token nobody added.
+    """
+    from shared.branding import COMPANY_CREDIT, COMPANY_NAME
+    from tests.frontend_source import panel_source
+
+    # The panel is plain JavaScript, so the names come from /config and the header and footer are
+    # rendered from them. The source must place both: the credit in the header, the name in the footer.
+    config = client.get("/config").json()
+    assert config["company_credit"] == COMPANY_CREDIT
+    assert config["company_name"] == COMPANY_NAME
+    source = panel_source()
+    assert "config.company_credit" in source
+    assert "config.company_name" in source
+
+
+async def test_the_watermark_points_at_an_asset_that_exists(client):
+    """The call screen references the company logo by URL, and a 404 there is a
+    broken image over a live interview."""
+    from shared.branding import COMPANY_LOGO_URL
+
+    from tests.frontend_source import join_source
+
+    assert client.get("/config").json()["company_logo_url"] == COMPANY_LOGO_URL
+    assert "config.company_logo_url" in join_source()
+
+    served = client.get(COMPANY_LOGO_URL)
+    assert served.status_code == 200
+    assert served.headers["content-type"] == "image/png"
+
+
+async def test_the_interviewer_is_never_told_who_built_it(client):
+    """Mitra is who the candidate talks to. Appinventiv is who wrote it, and it
+    has no business in a prompt: an interviewer that introduced itself as the
+    vendor would be a different product."""
+    from bot.blueprint_source import load_blueprint
+    from bot.brain.brain import InterviewBrain
+    from shared.branding import COMPANY_NAME
+
+    brain = InterviewBrain(load_blueprint())
+    assert COMPANY_NAME.lower() not in brain.plan_turn().system_instruction.lower()
+
+
+# -- focus absences ----------------------------------------------------------
+
+
+async def test_an_absence_is_recorded_against_the_interview(client):
+    """A fact the browser reported, stored beside the interview it belongs to."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    posted = client.post(
+        "/interviews/focus",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "absences": [{"at_seconds": 61.4, "seconds": 22.0, "kind": "hidden"}],
+        },
+    )
+
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["recorded"] == 1
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert view["focus_events"] == [
+        {"at_seconds": 61.4, "seconds": 22.0, "kind": "hidden"}
+    ]
+
+
+async def test_absences_accumulate_rather_than_replace(client):
+    """The page sends each absence as it ends, so a later report must not take
+    the earlier ones with it."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    creds = {"meeting_id": created["meeting_id"], "password": created["password"]}
+
+    client.post("/interviews/focus", json={**creds, "absences": [
+        {"at_seconds": 10.0, "seconds": 3.0, "kind": "blur"}]})
+    client.post("/interviews/focus", json={**creds, "absences": [
+        {"at_seconds": 90.0, "seconds": 44.0, "kind": "hidden"}]})
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert [a["seconds"] for a in view["focus_events"]] == [3.0, 44.0]
+
+
+async def test_an_interview_nobody_left_records_nothing(client):
+    """An absence is not a result. Nothing sent means nothing stored, and the
+    panel renders nothing rather than a zero."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+
+    assert view["focus_events"] is None
+
+
+async def test_focus_needs_the_candidates_own_credentials(client):
+    """Guarded exactly as joining is, and refused with the same one message so
+    it cannot become a way to probe for valid meeting ids."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    refused = client.post(
+        "/interviews/focus",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": "wrongpass",
+            "absences": [{"at_seconds": 1.0, "seconds": 30.0}],
+        },
+    )
+
+    assert refused.status_code == 401
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert view["focus_events"] is None
+
+
+async def test_implausible_absences_are_dropped(client):
+    """A zero-length absence is not an absence, and one longer than any
+    interview is a broken clock rather than a candidate who left for hours."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    client.post(
+        "/interviews/focus",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "absences": [
+                {"at_seconds": 5.0, "seconds": 0.0},
+                {"at_seconds": 6.0, "seconds": -4.0},
+                {"at_seconds": 7.0, "seconds": 60 * 60 * 24},
+                {"at_seconds": 8.0, "seconds": 12.5},
+            ],
+        },
+    )
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert [a["seconds"] for a in view["focus_events"]] == [12.5]
+
+
+async def test_the_stored_list_is_bounded(client):
+    """A page in a redraw loop must not be able to append for forty minutes.
+    Nothing is inferred from hitting the ceiling; it just stops growing."""
+    from app.interviews import MAX_FOCUS_ABSENCES
+
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    client.post(
+        "/interviews/focus",
+        json={
+            "meeting_id": created["meeting_id"],
+            "password": created["password"],
+            "absences": [
+                {"at_seconds": float(i), "seconds": 1.0}
+                for i in range(MAX_FOCUS_ABSENCES + 50)
+            ],
+        },
+    )
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+    assert len(view["focus_events"]) == MAX_FOCUS_ABSENCES
+
+
+async def test_focus_events_never_reach_the_report(client):
+    """It is context for a reviewer beside the report, never a field inside it.
+    The scorer does not see it and the transcript does not carry it."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    client.post("/interviews/focus", json={
+        "meeting_id": created["meeting_id"], "password": created["password"],
+        "absences": [{"at_seconds": 30.0, "seconds": 99.0}]})
+
+    view = client.get(f"/interviews/{created['interview_id']}").json()
+
+    assert view["focus_events"]
+    assert "focus" not in str(view["feedback_report"] or {}).lower()
+    assert "focus" not in str(view["transcript"] or {}).lower()
+
+
+# -- candidate guessing limits ------------------------------------------------------
+
+
+def _join(client, meeting_id: str, password: str):
+    return client.post(
+        "/interviews/join",
+        json={"meeting_id": meeting_id, "password": password, "consent": True},
+    )
+
+
+async def test_repeated_wrong_guesses_lock_the_meeting_even_with_the_right_password(client):
+    """Without a limit, an attacker who has the meeting ID can guess the eight-character
+    password as fast as the network allows. After five misses the meeting is locked."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    for guess in range(5):
+        assert _join(client, created["meeting_id"], f"guess{guess}").status_code == 401
+
+    locked = _join(client, created["meeting_id"], f"guess5")
+    assert locked.status_code == 429
+    assert int(locked.headers["Retry-After"]) > 0
+    # The right password is refused too while the lock holds. Otherwise the lock would
+    # only slow a guesser, not stop one.
+    assert _join(client, created["meeting_id"], created["password"]).status_code == 429
+    assert client.spawned == []
+
+
+async def test_a_lock_looks_the_same_for_a_real_meeting_and_a_missing_one(client):
+    """A different answer for a missing meeting would show which IDs exist."""
+    candidate_id = await make_candidate()
+    real = client.post(f"/candidates/{candidate_id}/interviews").json()["meeting_id"]
+    missing = "999-888-777"
+
+    for meeting in (real, missing):
+        for guess in range(5):
+            _join(client, meeting, f"guess{guess}")
+        assert _join(client, meeting, "another1").status_code == 429
+
+
+async def test_one_address_cannot_try_many_meetings(client):
+    """The per-meeting limit does not stop one address walking through many meetings,
+    each guessed only a few times. The per-client limit does."""
+    for i in range(30):
+        assert _join(client, f"111-222-{i:03d}", "guess").status_code == 401
+    assert _join(client, "111-222-999", "guess").status_code == 429
+
+
+async def test_a_correct_join_clears_the_meeting_counter(client):
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    for guess in range(4):
+        _join(client, created["meeting_id"], f"guess{guess}")
+
+    assert _join(client, created["meeting_id"], created["password"]).status_code == 200
+
+    # Four more misses are back under the limit, because the meeting counter was cleared.
+    for guess in range(4):
+        assert _join(client, created["meeting_id"], f"again{guess}").status_code == 401
+
+
+async def test_an_empty_focus_report_still_needs_the_candidates_credentials(client):
+    """The empty-list shortcut used to return before the credentials were checked."""
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+
+    wrong = client.post(
+        "/interviews/focus",
+        json={"meeting_id": created["meeting_id"], "password": "nope", "absences": []},
+    )
+    assert wrong.status_code == 401
+
+    right = client.post(
+        "/interviews/focus",
+        json={"meeting_id": created["meeting_id"], "password": created["password"], "absences": []},
+    )
+    assert right.status_code == 200
+    assert right.json() == {"recorded": 0}
+
+
+# -- the cost card's endpoint ----------------------------------------------------------
+
+
+def _usage_block() -> dict:
+    return {
+        "schema_version": 1,
+        "llm_live": {"calls": 2, "prompt_tokens": 1000, "completion_tokens": 100, "cached_tokens": 0},
+        "llm_judgment": {"calls": 1, "prompt_tokens": 500, "completion_tokens": 50, "cached_tokens": 0},
+        "llm_feedback": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0},
+        "tts_characters": 1000,
+        "stt_stream_seconds": 60.0,
+        "candidate_speech_seconds": 30.0,
+        "call_seconds": 120.0,
+        "models": {"live": "gpt-4.1-mini", "judgment": "gpt-4.1"},
+        "providers": {"stt": "deepgram", "tts": "elevenlabs", "llm": "openai"},
+    }
+
+
+async def test_the_cost_endpoint_refuses_anyone_not_signed_in(client, monkeypatch):
+    client.cookies.clear()
+    assert client.get("/admin/costs").status_code == 401
+
+
+async def test_the_cost_endpoint_names_no_candidate_and_reports_totals(client, monkeypatch):
+    from app import db, main
+
+    # No network from a test. The feed is absent, so LLM lines are unpriced and the report says so.
+    monkeypatch.setattr(main, "load_feed", lambda **kwargs: None)
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.session_metrics = {"usage": _usage_block()}
+        await session.commit()
+
+    response = client.get("/admin/costs")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "Prateek Verma" not in response.text  # no candidate is named in the cost view
+    assert body["prices"] is None
+    assert "llm_feed" in body["missing_rates"]
+    assert body["totals"]["partial"] == 1
+    row = body["interviews"][0]
+    assert row["id"] == created["interview_id"]
+    assert row["lines"]["llm_live"] is None  # unpriced, not guessed
+    assert row["call_minutes"] == 2.0
+
+
+async def test_the_cost_endpoint_prices_a_feed_model_when_one_is_available(client, monkeypatch):
+    from app import db, main
+    from shared.pricing import PriceFeed, ModelPrice
+
+    feed = PriceFeed(
+        updated_at="2026-10-26",
+        fetched_at="2026-11-06T00:00:00+00:00",
+        source="cache",
+        models={
+            "gpt-4.1-mini": ModelPrice("gpt-4.1-mini", "openai", "GPT-4.1 Mini", 0.4, 1.6, 0.1),
+            "gpt-4.1": ModelPrice("gpt-4.1", "openai", "GPT-4.1", 2.0, 8.0, 0.5),
+        },
+    )
+    monkeypatch.setattr(main, "load_feed", lambda **kwargs: feed)
+    monkeypatch.setenv("PRICE_TTS_PER_KCHAR", "0.30")
+    monkeypatch.setenv("PRICE_STT_PER_MIN", "0.0077")
+    monkeypatch.setenv("PRICE_CALL_PER_MIN", "0.004")
+    candidate_id = await make_candidate()
+    created = client.post(f"/candidates/{candidate_id}/interviews").json()
+    async with db.get_sessionmaker()() as session:
+        interview = await session.get(db.Interview, created["interview_id"])
+        interview.session_metrics = {"usage": _usage_block()}
+        await session.commit()
+
+    body = client.get("/admin/costs").json()
+
+    assert body["prices"]["updated_at"] == "2026-10-26"
+    assert body["missing_rates"] == []
+    row = body["interviews"][0]
+    assert row["complete"] is True
+    assert row["lines"]["llm_live"] == round(1000 / 1e6 * 0.4 + 100 / 1e6 * 1.6, 4)
+    assert body["totals"]["complete"] == 1
+    assert body["totals"]["estimate_usd"] == row["estimate_usd"]

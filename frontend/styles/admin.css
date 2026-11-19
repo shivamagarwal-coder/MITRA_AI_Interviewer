@@ -1,0 +1,210 @@
+    :root {
+      /* Brand. --accent is the mark's blue; --navy is the wordmark's. */
+      --accent: #1e5be8; --navy: #12243f;
+      --ink: #12141a; --muted: #5c6272; --line: #e3e6ec;
+      --bg: #f7f8fa; --ok: #1c8f5a; --warn: #b06f14; --bad: #b3261e;
+      --panel: #fff; --code: #f4f6fb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      background: #fff; border-bottom: 1px solid var(--line);
+      padding: 14px 24px; display: flex; align-items: center; gap: 14px;
+      position: sticky; top: 0; z-index: 10;
+    }
+    header .sub { color: var(--muted); font-size: 13px; }
+    /* Who built the tool, pushed to the far end of the bar it shares with the
+       product name. Same size and colour as the "Admin panel" label beside it,
+       so it reads as one more piece of chrome rather than as a second brand
+       competing with the first. */
+    header .by { margin-left: auto; color: var(--muted); font-size: 13px; }
+    main { max-width: 1080px; margin: 0 auto; padding: 26px 24px 40px; }
+    /* The quiet end of the page. A rule above it and nothing else, because a
+       footer with a background reads as a section of the product. */
+    /* Template buttons on the profile screen. A quiet chip rather than a
+       primary action: choosing one is a shortcut, and creating the profile is
+       the thing the employer is actually here to do. */
+    button.tplbtn {
+      padding: 7px 12px; font-size: 13px; font-weight: 600;
+      border-radius: 999px; border: 1px solid var(--line);
+      background: #fff; color: var(--ink); cursor: pointer;
+    }
+    button.tplbtn:hover { border-color: var(--muted); }
+    footer.credit {
+      max-width: 1080px; margin: 0 auto; padding: 18px 24px 40px;
+      border-top: 1px solid var(--line);
+      color: var(--muted); font-size: 12px; text-align: center;
+    }
+    h2 { font-size: 19px; margin: 0 0 4px; letter-spacing: -0.01em; }
+    h3 { font-size: 15px; margin: 26px 0 10px; }
+    p.sub { color: var(--muted); margin: 0 0 18px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 22px; margin-bottom: 16px;
+    }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .spread { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    button {
+      padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+      border-radius: 8px; border: 1px solid var(--line); background: #fff; color: var(--ink);
+    }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.danger { color: var(--bad); border-color: #f2c9c6; }
+    input[type=password] { width: 100%; padding: 11px 13px; font: inherit;
+      border: 1px solid var(--line); border-radius: 8px; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type=text], textarea {
+      width: 100%; padding: 10px 12px; font: inherit;
+      border: 1px solid var(--line); border-radius: 8px;
+    }
+    textarea { min-height: 76px; resize: vertical; }
+    .pill {
+      display: inline-block; padding: 2px 9px; border-radius: 999px;
+      font-size: 12px; font-weight: 600; border: 1px solid var(--line);
+    }
+    .pill.ok { color: var(--ok); border-color: #bfe3d0; background: #f0f9f4; }
+    .pill.warn { color: var(--warn); border-color: #f0dcb8; background: #fdf7ec; }
+    .pill.bad { color: var(--bad); border-color: #f2c9c6; background: #fdf1f0; }
+    .list-item {
+      border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+      margin-bottom: 9px; background: #fff; cursor: pointer;
+    }
+    .list-item:hover { border-color: var(--accent); }
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .bar { height: 7px; background: var(--accent); border-radius: 4px; }
+    .chat { display: flex; flex-direction: column; gap: 12px; margin-bottom: 18px; }
+    .msg { padding: 12px 15px; border-radius: 11px; max-width: 78%; }
+    .msg.ai { background: var(--code); align-self: flex-start; }
+    .msg.me { background: var(--accent); color: #fff; align-self: flex-end; }
+    .turn { padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .turn .who { font-weight: 600; font-size: 13px; }
+    .turn .who.int { color: var(--accent); }
+    /* Only applied when a recording is actually there to seek, so the cursor
+       never promises something that will not happen. */
+    .turn.seekable { cursor: pointer; }
+    .turn.seekable:hover { background: #f6f8fb; }
+    .kv { display: grid; grid-template-columns: 200px 1fr; gap: 6px 14px; font-size: 14px; }
+    .kv div:nth-child(odd) { color: var(--muted); }
+    pre {
+      background: var(--code); border: 1px solid var(--line); border-radius: 9px;
+      padding: 13px; overflow-x: auto; font-size: 12.5px; margin: 0;
+    }
+    .hidden { display: none !important; }
+    .crumb { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+    .crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+    .err { color: var(--bad); margin-top: 10px; }
+    .cred {
+      background: #f0f4ff; border: 1px solid #c8d6f7; border-radius: 10px;
+      padding: 14px 16px; font-size: 15px; margin-top: 14px;
+    }
+    /* One row per fact, each copyable on its own: these get retyped into an
+       email otherwise, and a mistyped password is a candidate locked out. */
+    .credline {
+      display: flex; align-items: center; gap: 10px; padding: 7px 0;
+      border-top: 1px solid #dbe4fa;
+    }
+    .credline:first-of-type { border-top: 0; padding-top: 10px; }
+    .credlabel {
+      color: var(--muted); font-size: 12px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em;
+      min-width: 88px; flex-shrink: 0;
+    }
+    .credline strong { overflow-wrap: anywhere; }
+    button.copy {
+      margin-left: auto; flex-shrink: 0; padding: 5px 8px; line-height: 1;
+      color: var(--accent); border-color: #c8d6f7; background: #fff;
+      min-width: 32px;
+    }
+    button.copy:hover { border-color: var(--accent); }
+    button.copy-all {
+      padding: 5px 11px; font-size: 12.5px;
+      color: var(--accent); border-color: #c8d6f7; background: #fff;
+    }
+    button.copied { color: var(--ok); border-color: #bfe3d0; background: #f0f9f4; }
+
+    /* Links styled as buttons: navigation stays real <a href> so back,
+       middle-click and copy-link-address all work. */
+    a.btn {
+      display: inline-block; padding: 10px 16px; font-size: 14px; font-weight: 600;
+      border-radius: 8px; border: 1px solid var(--line); background: #fff;
+      color: var(--ink); text-decoration: none;
+    }
+    a.btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    a.list-item:hover { border-color: var(--accent); }
+
+    label.lbl {
+      display: block; margin: 18px 0 6px; font-size: 13px; font-weight: 600;
+    }
+    label.lbl:first-of-type { margin-top: 0; }
+
+    .tag {
+      display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 6px;
+      font-size: 12px; font-weight: 600; background: var(--code); color: var(--muted);
+      border: 1px solid var(--line);
+    }
+    .tag.warn { background: #fdf7ec; color: var(--warn); border-color: #f0dcb8; }
+    .warntext { color: var(--warn); }
+
+    /* The finished discussion collapses to a single line you can open. */
+    summary.disclosure {
+      cursor: pointer; display: flex; justify-content: space-between;
+      align-items: center; gap: 12px; list-style: none;
+    }
+    summary.disclosure::-webkit-details-marker { display: none; }
+    summary.disclosure::before { content: "▸ "; color: var(--muted); }
+    details[open] > summary.disclosure::before { content: "▾ "; }
+
+    .note {
+      background: #fdf7ec; border: 1px solid #f0dcb8; border-radius: 9px;
+      padding: 13px 15px; font-size: 14px; margin-bottom: 14px;
+    }
+    .card.note { background: #fdf7ec; border-color: #f0dcb8; }
+
+    /* Report */
+    .score-big { font-size: 34px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
+    .score-mid { font-size: 22px; font-weight: 700; line-height: 1; }
+    .score-max { font-size: 13px; font-weight: 500; color: var(--muted); }
+    .meter {
+      height: 8px; background: var(--code); border-radius: 5px;
+      overflow: hidden; margin-top: 12px;
+    }
+    .meter-fill { height: 100%; background: var(--accent); border-radius: 5px; }
+    blockquote.quote {
+      margin: 10px 0 0; padding: 11px 14px; border-left: 3px solid var(--accent);
+      background: var(--code); border-radius: 0 8px 8px 0; font-size: 14px;
+    }
+    blockquote.quote .small { display: block; margin-top: 6px; }
+
+    /* -- brand ------------------------------------------------------------ */
+
+    /* The artwork is a hero lockup: mark, wordmark and the full expansion
+       together. At header size the expansion line becomes an unreadable smudge,
+       so the header uses the name set in type and the artwork appears where it
+       has room to be read. */
+    header .brand {
+      font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase;
+      color: var(--navy); font-size: 15px;
+    }
+
+    /* Sign-in: the brand on the left, the way in on the right. The panel is a
+       dense working tool everywhere else, so this is the one screen with room
+       to say what the product is. */
+    .signin {
+      display: grid; grid-template-columns: 1.25fr 1fr; gap: 40px;
+      align-items: center; min-height: calc(100vh - 210px);
+    }
+    /* Sized so the lockup itself reads across a room: it occupies about half
+       the artwork's width, so the file has to be drawn wider than it looks. */
+    .signin .logo { width: 100%; max-width: 680px; height: auto; display: block; }
+    .signin .card { margin-bottom: 0; }
+
+    @media (max-width: 860px) {
+      .signin { grid-template-columns: 1fr; gap: 26px; min-height: 0; }
+      .signin .logo { max-width: 420px; margin: 0 auto; }
+    }
+

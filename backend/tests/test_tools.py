@@ -1,0 +1,320 @@
+"""The interviewer ending the interview itself.
+
+Pattern matching for "I want to stop" has now failed live twice and been
+rewritten once. Even rewritten it misses every one of sixteen natural phrasings,
+because a phrase list contains only what somebody thought of in advance. The
+model reading those sentences understands all of them; it had no way to act, so
+its understanding stayed trapped in prose we then tried to pattern-match back
+out of it.
+
+These cover the wiring. Whether the model *chooses* to call the tool is a
+behaviour question, and `scripts/withdrawal_run.py` is where that is checked
+against real conversations.
+"""
+
+import pytest
+
+from bot.brain.brain import InterviewBrain
+from bot.tools import END_INTERVIEW, TOOLS, register
+from tests.test_brain import tiny_blueprint
+
+
+class FakeLLM:
+    def __init__(self):
+        self.registered = {}
+
+    def register_function(self, name, handler, **kwargs):
+        self.registered[name] = handler
+
+
+class FakeParams:
+    def __init__(self, **arguments):
+        self.arguments = arguments
+        self.result = "not called"
+
+    async def result_callback(self, value):
+        self.result = value
+
+
+# -- the schema the model is given -------------------------------------------
+
+
+def test_the_tool_is_advertised_to_the_model():
+    names = [t.name for t in TOOLS.standard_tools]
+
+    assert names == [END_INTERVIEW]
+
+
+def test_the_description_teaches_the_distinction_that_matters():
+    """Leaving the interview, versus talking about ending something else. That
+    confusion is the only expensive mistake available here."""
+    schema = TOOLS.standard_tools[0]
+
+    assert "any wording and in any language" in schema.description
+    assert "end that project early" in schema.description
+    assert "Declining a question is not leaving" in schema.description
+    assert "do not call it" in schema.description
+
+
+def test_it_asks_why_so_the_record_says_so():
+    schema = TOOLS.standard_tools[0]
+
+    assert set(schema.required) == {"said", "explicit"}
+
+
+# -- what happens when it is called ------------------------------------------
+
+
+async def test_a_call_the_patterns_corroborate_ends_the_interview():
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Just end this interview.")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    await llm.registered[END_INTERVIEW](FakeParams(said="end the interview", explicit=True))
+
+    assert brain.withdrew is True
+    assert brain.current_section.kind == "closing"
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "We had to end that project early because of budget",
+        "I want to stop doing manual QA, that's why I moved",
+    ],
+)
+async def test_a_call_the_patterns_do_not_corroborate_asks_first(said):
+    """Measured false positives from gpt-4.1-mini. Ending an interview because
+    somebody described ending a project is the one expensive mistake here, so
+    the model alone is not enough to do it."""
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text=said)
+    llm = FakeLLM()
+    register(llm, brain)
+
+    await llm.registered[END_INTERVIEW](FakeParams(said=said, explicit=True))
+
+    assert brain.withdrew is False
+    assert "THEY HAVE ASKED TO STOP" in brain.plan_turn().system_instruction
+
+
+async def test_a_phrasing_only_the_model_catches_still_gets_asked():
+    """"Can we wrap this up?" is invisible to the patterns, so it is a question
+    rather than an ending. One sentence is the cost of being wrong."""
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Can we wrap this up?")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    await llm.registered[END_INTERVIEW](FakeParams(said="Can we wrap this up?", explicit=True))
+
+    assert brain.withdrew is False
+    assert "THEY HAVE ASKED TO STOP" in brain.plan_turn().system_instruction
+
+
+async def test_a_soft_call_asks_once_instead_of_ending():
+    """The model can say it is unsure. Then they get the courtesy of a question
+    rather than having their interview ended on a guess."""
+    brain = InterviewBrain(tiny_blueprint())
+    llm = FakeLLM()
+    register(llm, brain)
+
+    params = FakeParams(said="I think I'm done", explicit=False)
+    await llm.registered[END_INTERVIEW](params)
+
+    assert brain.withdrew is False
+    assert "THEY HAVE ASKED TO STOP" in brain.plan_turn().system_instruction
+
+
+async def test_the_tool_returns_something_or_nothing_is_ever_said():
+    """Returning None is silence, and it failed live exactly that way.
+
+    Pipecat only runs the follow-up completion `if frame.result:`. With a None
+    result the candidate asked to stop, the tool fired correctly, and then
+    thirty seconds of nothing while the brain sat in the closing waiting for a
+    goodbye that was never generated.
+    """
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Just end this interview.")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    params = FakeParams(said="end the interview", explicit=True)
+    await llm.registered[END_INTERVIEW](params)
+
+    assert params.result, "a falsy result means the interviewer never speaks"
+    assert params.result["ended"] is True
+    assert "say goodbye" in params.result["next"]
+
+
+async def test_an_unconfirmed_call_is_told_to_ask_rather_than_farewell():
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Can we wrap this up?")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    params = FakeParams(said="Can we wrap this up?", explicit=True)
+    await llm.registered[END_INTERVIEW](params)
+
+    assert params.result["ended"] is False
+    assert "end here or carry on" in params.result["next"]
+
+
+async def test_calling_it_twice_is_harmless():
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Just end the interview.")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    for _ in range(3):
+        await llm.registered[END_INTERVIEW](FakeParams(said="end the interview", explicit=True))
+
+    assert brain.withdrew is True
+    assert brain.current_section.kind == "closing"
+
+
+# -- the two paths must agree ------------------------------------------------
+
+
+def test_patterns_and_the_tool_share_one_entry_point():
+    """Two ways in, one behaviour. Separate handling is how they drift."""
+    by_pattern = InterviewBrain(tiny_blueprint())
+    by_pattern.observe(bot_text="Tell me about a project.")
+    by_pattern.observe(candidate_text="Just end the interview.")
+
+    by_tool = InterviewBrain(tiny_blueprint())
+    by_tool.observe(bot_text="Tell me about a project.")
+    by_tool.candidate_asked_to_stop(said="Can we wrap this up?", explicit=True)
+
+    assert by_pattern.withdrew == by_tool.withdrew is True
+    assert by_pattern.current_section.id == by_tool.current_section.id
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "Can we wrap this up?",
+        "This isn't for me, sorry",
+        "I need to jump off",
+        "Actually I'm no longer interested",
+        "Bas, ab band karo",
+    ],
+)
+def test_the_phrasings_patterns_will_never_catch(said):
+    """Every one of these is missed by the pattern matcher, and every one is
+    obvious to the model. This is the whole reason the tool exists."""
+    from bot.brain.withdrawal import wants_to_stop
+
+    assert wants_to_stop(said) is False, "if patterns now catch this, the test is stale"
+
+    brain = InterviewBrain(tiny_blueprint())
+    brain.candidate_asked_to_stop(said=said, explicit=True)
+    assert brain.withdrew is True
+
+
+# -- it must not fire on its own ---------------------------------------------
+
+
+def test_a_brain_with_no_tool_call_carries_on():
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="We had to end that project early because of budget.")
+
+    assert brain.withdrew is False
+    assert brain.current_section.kind != "closing"
+
+
+# -- a skip is not a withdrawal ----------------------------------------------
+
+
+async def test_the_tool_called_on_a_skip_does_not_offer_to_stop():
+    """The bug from `int_7e31aaff4ab2`, at 234s.
+
+    The candidate said "right now, I don't know the answer of this question.
+    Can we skip it?" and the interviewer replied "Okay. Would you like to end
+    the interview here or continue?" — the `OFFER_TO_STOP` block, word for word.
+
+    The corroboration gate worked: the patterns disagreed, so nothing ended. But
+    being asked to confirm leaving is not a free sentence when all they wanted
+    was a different question.
+    """
+    said = "right now, I don't know the answer of this question. Can we skip it?"
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text=said)
+    llm = FakeLLM()
+    register(llm, brain)
+
+    params = FakeParams(said=said, explicit=True)
+    await llm.registered[END_INTERVIEW](params)
+
+    assert brain.withdrew is False
+    assert params.result["ended"] is False
+    assert "THEY HAVE ASKED TO STOP" not in brain.plan_turn().system_instruction
+    assert "ask a different question" in params.result["next"]
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        # The patterns catch this one, so it ends at once.
+        ("just end this interview", True),
+        # These they do not, so they get the one confirming question. Either
+        # way the veto must stay out of it: "skip" appearing in a sentence
+        # cannot be what decides whether somebody is allowed to leave.
+        ("can we skip the rest of this interview", False),
+        ("skip this, I'm done", False),
+    ],
+    ids=lambda v: v[0] if isinstance(v, tuple) else str(v),
+)
+def test_a_skip_never_swallows_a_real_withdrawal(said):
+    """The direction that must not be traded away."""
+    from bot.brain.withdrawal import asked_to_skip_question
+
+    assert asked_to_skip_question(said[0]) is False
+
+
+async def test_a_withdrawal_the_patterns_miss_is_still_asked_about():
+    """Unchanged by the skip veto, and checked because "skip" is in it."""
+    said = "can we skip the rest of this interview"
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text=said)
+    llm = FakeLLM()
+    register(llm, brain)
+
+    await llm.registered[END_INTERVIEW](FakeParams(said=said, explicit=True))
+
+    assert "THEY HAVE ASKED TO STOP" in brain.plan_turn().system_instruction
+
+
+async def test_a_withdrawal_the_patterns_catch_still_ends_at_once():
+    """The explicit path is untouched: the veto is only ever consulted when the
+    patterns did not corroborate."""
+    brain = InterviewBrain(tiny_blueprint())
+    brain.observe(bot_text="Tell me about a project.")
+    brain.observe(candidate_text="Skip all this, just end this interview.")
+    llm = FakeLLM()
+    register(llm, brain)
+
+    await llm.registered[END_INTERVIEW](
+        FakeParams(said="just end this interview", explicit=True)
+    )
+
+    assert brain.withdrew is True
+    assert brain.current_section.kind == "closing"
+
+
+def test_the_description_separates_skipping_from_leaving():
+    schema = TOOLS.standard_tools[0]
+
+    assert "can we skip it" in schema.description
+    assert "Asking to skip" in schema.description
+    assert "not for the interview" in schema.description

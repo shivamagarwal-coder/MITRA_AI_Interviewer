@@ -1,0 +1,52 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Interview artifacts (transcripts / metrics from local runs)
+backend/sessions/
+
+# Local SQLite fallback used when DATABASE_URL is unset
+*.db
+*.db-journal
+
+# Real CVs and JDs used for local testing. These contain personal data —
+# names, phone numbers, email addresses — and must never be committed.
+# Synthetic fixtures live in backend/tests/fixtures/documents/ instead.
+cv/
+jds/
+uploads/
+
+.DS_Store
+
+# Database backups. They hold transcripts, CVs and job descriptions. Never commit them.
+backend/backups/
+*.dump
+*.dump.sha256
+*.before-restore
+
+# Terraform. State holds secrets and the database password, so it never enters git.
+# The lock file (.terraform.lock.hcl) is committed on purpose: it pins provider versions.
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/*.tfplan
+infra/**/terraform.tfvars
+infra/**/backend.hcl
+
+# Cached price feed (llm-prices.com). Public data, but a local cache has no reason to be committed.
+backend/.cache/
+.env.example

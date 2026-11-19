@@ -1,0 +1,266 @@
+"""Tests for the opening warm-up.
+
+Driven by candidate feedback on a live session: the interview "starts banging".
+The first thing heard was a single long breath containing a greeting, the role,
+and a three-part question about a named employer.
+
+Two separable problems, both tested here:
+
+1. **Structure** — hello, orientation and connection are three turns, not one.
+2. **Pacing** — long sentences are spoken as one rushed breath regardless of
+   the TTS speed setting, so sentence length is a prompt-level rule.
+"""
+
+import pytest
+
+from bot.blueprint_source import load_blueprint
+from bot.brain.brain import InterviewBrain
+from bot.brain.state import BrainConfig
+from shared.contracts import SectionKind
+
+
+def build(*, time_of_day: str | None = "evening", candidate: str | None = None):
+    blueprint = load_blueprint()
+    if candidate:
+        blueprint = blueprint.model_copy(
+            update={"candidate_name": candidate, "candidate_summary": "Twelve years in AI product."}
+        )
+    return InterviewBrain(blueprint, config=BrainConfig(), time_of_day=time_of_day)
+
+
+def prompt_of(brain) -> str:
+    return " ".join(brain.plan_turn().system_instruction.lower().split())
+
+
+def say(brain, text="I'm doing well, thanks for asking."):
+    brain.tick(brain.elapsed_seconds + 10)
+    brain.observe(bot_text="Hello there.", candidate_text=text)
+
+
+# -- the first thing they hear ----------------------------------------------
+
+
+def test_first_turn_greets_and_introduces_itself():
+    """A candidate about to be interviewed by a machine must be told so in the
+    first breath, not left to ask "who are you?" — which is what happened live."""
+    prompt = prompt_of(build())
+
+    assert "say hello and introduce yourself" in prompt
+    assert "you are an ai interviewer" in prompt
+    assert "do not skip this" in prompt
+    assert "do not start the interview" in prompt
+    assert "absolutely not yet: the role details" in prompt
+
+
+def test_first_turn_uses_the_time_of_day():
+    assert "good evening" in prompt_of(build(time_of_day="evening"))
+    assert "good morning" in prompt_of(build(time_of_day="morning"))
+
+
+def test_greeting_falls_back_when_the_time_is_unknown():
+    """The brain is pure — if nobody injected a clock it must not guess."""
+    prompt = prompt_of(build(time_of_day=None))
+
+    assert "hello" in prompt
+    assert "good none" not in prompt
+
+
+def test_greeting_uses_the_candidates_first_name():
+    prompt = prompt_of(build(candidate="Prateek Verma"))
+
+    assert "prateek" in prompt
+    # First name only — surnames in a spoken greeting sound like a summons.
+    assert "prateek verma." not in prompt
+
+
+# -- the shape of the warm-up ------------------------------------------------
+
+
+def test_second_turn_orients_without_diving_in():
+    brain = build()
+    say(brain)
+
+    prompt = prompt_of(brain)
+    assert "orient them" in prompt
+    assert "senior product manager" in prompt
+    assert "do not mention anything from their cv yet" in prompt
+
+
+def test_third_turn_allows_one_light_personal_connection():
+    """What the candidate asked for: connect a little before going deep."""
+    brain = build(candidate="Prateek Verma")
+    say(brain)
+    say(brain, "I'm currently leading AI product work at an agency.")
+
+    prompt = prompt_of(brain)
+    assert "one light connection" in prompt
+    assert "small talk, not an interview question" in prompt
+    # The leak this closes: turn three asked "how do you decide which features
+    # to prioritise" — a competency question wearing a warm-up's clothes.
+    assert "do not ask how they decide, prioritise" in prompt
+
+
+def test_warm_up_is_over_before_the_real_questions():
+    brain = build()
+    for _ in range(4):
+        say(brain, "I have about twelve years in product management.")
+
+    assert brain.current_section.kind == SectionKind.COMPETENCY
+
+
+def test_opening_carries_no_probing_instructions():
+    """The regression: a multi-part question about a named employer, cold.
+
+    The blueprint's interviewing guidance ("probe trade-offs", "push past
+    frameworks") and the employer's red flags both steer toward evaluation.
+    Neither belongs in a greeting — they were pulling the model back to the
+    deep end the warm-up exists to hold off.
+    """
+    for turns in range(3):
+        brain = build(candidate="Prateek Verma")
+        for _ in range(turns):
+            say(brain, "I have about twelve years in product management.")
+        if brain.current_section.kind != SectionKind.OPENING:
+            continue
+
+        prompt = prompt_of(brain)
+        assert "how to interview" not in prompt
+        assert "things worth noticing" not in prompt
+        assert "probe trade-offs" not in prompt
+
+
+def test_red_flags_do_reach_the_competency_sections():
+    """They are gathered from the employer, so they must actually be used."""
+    brain = build()
+    for _ in range(4):
+        say(brain, "I have about twelve years in product management.")
+    assert brain.current_section.kind == SectionKind.COMPETENCY
+
+    prompt = prompt_of(brain)
+    assert "things worth noticing" in prompt
+    assert "never deliver a verdict" in prompt
+
+
+# -- pacing ------------------------------------------------------------------
+
+
+def test_voice_rules_cap_how_long_a_turn_is():
+    """TTS speed alone cannot fix a long turn — it is still one breath.
+
+    This used to assert a per-*sentence* cap, which is what the prompt said:
+    fifteen words a sentence, two or three sentences a turn. That permits
+    forty-five words, so the twenty-seven-word turns measured on a real
+    interview were compliant. The cap is now on the turn, which is the thing a
+    candidate actually sits through.
+    """
+    prompt = prompt_of(build())
+
+    assert "twenty words" in prompt
+    assert "count them before you answer" in prompt
+    assert "one idea per sentence" in prompt
+    assert "full stops, not commas" in prompt
+
+
+def test_one_question_per_turn_is_stated_checkably():
+    """"Ask one question at a time" was being violated routinely. A countable
+    rule — exactly one question mark — is harder to slide past."""
+    prompt = prompt_of(build())
+
+    assert "exactly one question mark" in prompt
+
+
+def test_voice_rules_forbid_stacking_greeting_and_question():
+    prompt = prompt_of(build())
+
+    assert "never stack a greeting, an explanation and a question" in prompt
+
+
+def test_tts_speed_is_below_default():
+    """An interviewer who rattles makes a candidate feel hurried."""
+    from bot.services.tts import TTS_SPEED
+
+    assert 0.7 <= TTS_SPEED < 1.0
+
+
+# -- the greeting is spoken, not generated ------------------------------------
+
+
+def test_the_opening_line_is_written_not_generated():
+    """It was already spelled out word for word in the opening prompt and the
+    model reproduced it almost verbatim. A round trip for a line we had already
+    written cost seconds of somebody sitting in silence wondering whether the
+    call had connected."""
+    from bot.brain.brain import InterviewBrain
+    from bot.blueprint_source import load_blueprint
+    from shared.branding import BOT_NAME
+
+    brain = InterviewBrain(load_blueprint(), time_of_day="afternoon")
+    line = brain.opening_line()
+
+    assert line.startswith("Good afternoon")
+    assert BOT_NAME in line
+    assert "AI interviewer" in line
+    assert line.count("?") == 1
+
+
+def test_the_opening_line_works_without_a_time_of_day():
+    """Outside greeting hours there is no "good morning" to say."""
+    from bot.brain.brain import InterviewBrain
+    from bot.blueprint_source import load_blueprint
+
+    line = InterviewBrain(load_blueprint(), time_of_day=None).opening_line()
+
+    assert line.startswith("Hello")
+    assert "Good None" not in line
+
+
+def test_the_interviewer_never_introduces_itself_twice():
+    """A candidate who says hello first used to consume the opening turn, and
+    the interview began without ever saying who was asking. Now the greeting is
+    already out before anyone can pre-empt it, and the prompt must not ask for
+    another one."""
+    from bot.brain.brain import InterviewBrain
+    from bot.blueprint_source import load_blueprint
+
+    brain = InterviewBrain(load_blueprint(), time_of_day="afternoon")
+    brain.observe(bot_text=brain.opening_line())
+
+    assert "SAY HELLO AND INTRODUCE" not in brain.plan_turn().system_instruction
+
+
+def test_a_candidate_speaking_first_still_hears_the_introduction():
+    """The gate that drops audio before the interviewer speaks stays in force,
+    and the greeting no longer depends on a model turn that speech could
+    consume."""
+    from bot.brain.brain import InterviewBrain
+    from bot.blueprint_source import load_blueprint
+
+    brain = InterviewBrain(load_blueprint(), time_of_day="afternoon")
+    brain.observe(candidate_text="Hello? Are you there?")   # before the greeting
+
+    assert brain.current_section.turns_spent == 0
+    assert "AI interviewer" in brain.opening_line()
+
+
+def test_the_audio_path_is_given_time_to_settle():
+    """`on_client_connected` fires before the candidate's browser has subscribed
+    to our audio track, so anything spoken immediately is not carried. Reported
+    live as the greeting starting mid-word, with "Good" missing from "Good
+    morning".
+
+    It was hidden while the greeting went through the model, because the round
+    trip took seconds and the path settled inside it. Speaking immediately
+    removed that accidental delay and exposed the gap.
+    """
+    import inspect
+
+    from bot import run_bot
+
+    assert run_bot.GREETING_SETTLE_SECONDS >= 0.5, (
+        "too short and the first word is clipped again"
+    )
+    assert run_bot.GREETING_SETTLE_SECONDS <= 1.5, (
+        "the whole point was that the greeting arrives promptly"
+    )
+    source = inspect.getsource(run_bot)
+    assert "asyncio.sleep(GREETING_SETTLE_SECONDS)" in source
